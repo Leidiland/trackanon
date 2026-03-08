@@ -1,0 +1,36 @@
+# Files
+*.yaml
+*.pkl
+*.flist
+*.zip
+*.out
+*.npy
+*.gz
+*.ckpt
+*.pth
+*.log
+*.pyc
+*.csv
+*.yml
+*.json
+
+# Images / Videos
+#*.png
+#*.jpg
+*.jpeg
+*.m4a
+*.mkv
+*.mp4
+
+# Directories
+.cache/
+__pycache__/
+.venv/
+outputs/
+.debug/
+.idea/
+
+# From pip setup
+build/
+*.egg-info
+*.egg

@@ -1,0 +1,324 @@
+name: diffusion
+comfyui_host: "127.0.0.1"
+comfyui_port: 8188
+
+# Workflow templates (ComfyUI API format).
+# inpaint_default:  mask-only inpainting, no pose conditioning.
+# workflow_pose:    with ControlNet OpenPose — used automatically when the pose
+#                   stage is active and keypoints are available.
+# workflow_prewarm: image-to-image used by PrewarmGenerator at startup. KPL
+#                   representative photo seeds the noised latent; denoise=0.9
+#                   destroys fine facial identity while preserving coarse
+#                   semantics (gender, ethnicity, age) — closes the txt2img
+#                   bias gap. An anti-leak gate (prewarm_kpl_leak_threshold)
+#                   rejects candidates whose FaceID still resembles the KPL.
+workflow: configs/anonymization/workflows/inpaint_default.json
+workflow_pose: configs/anonymization/workflows/img2img_pose_setmask.json
+workflow_prewarm: configs/anonymization/workflows/img2img_default.json
+# workflow_face_polish: chained-KSampler face polish (ADR-0019). Selected at
+# regen prep time when face_polish.enabled is true and InsightFace returns a
+# usable face bbox; otherwise the pipeline falls through to workflow_pose.
+workflow_face_polish: configs/anonymization/workflows/face_polish.json
+
+# PrewarmGenerator best-of-K budget (ADR-0010 addendum). For each Identity
+# the generator queues K text-to-image calls (seeds seed+0..seed+K-1), keeps
+# the face-validated survivors, scores each by det_score × frontality × min
+# cosine distance to already-chosen Personas, and returns the best
+# (crop, embedding). Zero validations within K → hard-abort at startup.
+# Higher K trades startup cost for Persona quality + spread.
+prewarm_candidates: 8
+
+# Optional debug dump for the best-of-K selection. When non-empty, the K
+# candidate PNGs and a `chosen.flag` (containing the chosen seed) are written
+# under `<prewarm_debug_dir>/<gid>/`. Runtime pipeline never reads from this
+# directory — operator inspection only.
+prewarm_debug_dir: ""
+
+# img2img anti-leak gate: cosine ceiling for FaceID similarity to the KPL
+# face centroid. Candidates above this are rejected as too-identifying.
+# 0.3 = strict (any visual resemblance disallowed); 0.5 = loose. Set higher
+# if PrewarmFailure fires on legitimate prompts because every candidate
+# leaks slightly. Set lower for tighter privacy.
+prewarm_kpl_leak_threshold: 0.3
+
+# === Sampler preset (DPM++, validated 2026-05-14, img2img_pose_setmask.json) =====
+# Active values are below; this block is a revert reference.
+#   strength_pose:    0.50     # SetLatentNoiseMask removes the gray-fill prior; 0.55 broke
+#                              # gid3 (female-portrait hallucination) on a difficult pose, so
+#                              # backed off to 0.50 for stability while keeping moderate
+#                              # clothing/hair leakage reduction over the d=0.45 baseline
+#   face_strength:    0.2
+#   body_strength:    0.5
+#   lora_strength:    0.3
+#   controlnet_strength:    0.9
+#   controlnet_end_percent: 1.0
+#
+# Resolved limitation: the prior DPM++ preset on workflows/inpaint_pose.json (VAEEncode-
+# ForInpaint, strength_pose=0.85) collapsed under IPA-vs-ControlNet at any face_strength
+# >0 — oversized-face regens. Replacing the inpaint encoder with VAEEncode → SetLatent-
+# NoiseMask on the non-inpaint checkpoint removes the gray-fill prior and lets DPM++ run
+# without IPA-vs-ControlNet conflict at moderate denoise.
+#
+# Open limitation: clothing/hair leak from the init latent remains partial even at 0.55.
+# Selective gray-fill of the body region in the init image (face latent preserved, body
+# replaced with gray before VAEEncode) is the next mitigation under evaluation.
+# =================================================================
+
+# Diffusion parameters
+prompt: "a person, photorealistic, high quality, warm skin tone, soft natural light, sharp focus"
+negative_prompt: "deformed, mutated, blurry, low quality, artifacts, watermark, text, blue skin, grey skin, washed out"
+steps: 20
+cfg_scale: 7.0
+# Runtime img2img denoise. init_rgb is always the current frame's crop.
+# - strength applies to the inpaint_default workflow (VAEEncodeForInpaint, gray-fill
+#   prior — denoise must stay ≥0.85 to escape gray).
+# - strength_pose applies to the active pose workflow (img2img_pose_setmask.json:
+#   VAEEncode → SetLatentNoiseMask, no gray-fill — 0.50 balances modest clothing-leak
+#   reduction against the d=0.55+ hallucination risk seen on fragile poses like gid3 frame=15).
+strength: 0.85
+strength_pose: 0.50
+seed: -1               # -1 = derive from global_id for per-identity consistency
+
+# Required ComfyUI model files (place in ComfyUI's models/ subdirectories):
+#   checkpoints/Realistic_Vision_V6.0_NV_B1_inpainting_fp16.safetensors (~2 GB, inpaint workflows)
+#   checkpoints/Realistic_Vision_V6.0_NV_B1_fp16.safetensors            (~2 GB, txt2img prewarm — non-inpainting variant required)
+#   controlnet/control_v11p_sd15_openpose.pth                           (~1.5 GB, pose workflow only)
+# scripts/download_weights.sh fetches the non-inpainting variant; the inpainting
+# variant must be placed manually (gated download).
+model_name: "Realistic_Vision_V6.0_NV_B1_inpainting_fp16.safetensors"
+vae_name: "vae-ft-mse-840000-ema-pruned.safetensors"
+controlnet_name: "control_v11p_sd15_openpose.pth"
+controlnet_strength: 0.9
+controlnet_end_percent: 1.0
+
+# ROI crop sizing — person is cropped, inpainted at this resolution, pasted back.
+# Shorter side is set to crop_target_short; longer side is capped at crop_max_long.
+# Both are snapped to multiples of 64 (SD latent grid requirement).
+crop_target_short: 512
+crop_max_long: 768
+padding_px: 32         # extra pixels of frame context around the detection bbox
+
+# Paste-back blending mode.
+# "hard":    copy pixels directly under mask (~0.5 ms/person)
+# "poisson": seamlessClone for smooth edge blending (~10 ms/person)
+blend_mode: "poisson"
+
+# --- Mask-tuning defaults -----------------------------------------------------
+# Tuned via tests/manual/sweep_mask_params.py on
+# data/input_videos/5_sec_test_1080p25.mp4 (one clean indoor clip, 3 sample
+# frames, 2026-05-12). See ADR-0012 addendum "mask-tuning knobs and refiner
+# deferral" for the operator-review posture used to pick these values.
+
+# Dilate the SAM 3 mask before paste-back to close hair/edge leakage where the
+# segmentation underestimates the person silhouette. Mild dilate (2 px) buys
+# headroom for hair fringes without spilling generated content onto background.
+mask_dilate_px: 8
+
+# Erode the SAM 3 mask before paste-back to pull the boundary inward when the
+# segmentation over-includes background pixels (visible halo of generated
+# content painted over background). Applied before mask_dilate_px, so equal
+# values give the operator a clean (approximate) no-op cancellation point.
+# 0 on the tuning clip — SAM 3 silhouettes were tight; raise when production
+# footage shows visible halos.
+mask_erode_px: 0
+# --- end mask-tuning defaults -------------------------------------------------
+
+# ADR-0012 mask-quality dispatch floor. Detections with grossly-incomplete
+# masks route to the Fallback Anonymizer instead of diffusion.
+#  - mask_floor_ratio: minimum mask_area / bbox_area to dispatch to diffusion.
+#  - mask_score_floor: minimum SAM 3 mask_score (applies only when the row's
+#                      mask_source == "detection").
+#  - mask_score_pass_override: when set, a sub-ratio_floor mask is rescued
+#                      to Pass if SAM 3's mask_score is at or above this
+#                      value. Defends crowded-scene occlusions where the
+#                      visible portion of an occluded person produces a
+#                      narrow-but-valid mask (typical mask_score ≥ 0.93).
+#                      Empty / null disables the rescue (strict ratio gate).
+mask_floor_ratio: 0.2
+mask_score_floor: 0.5
+mask_score_pass_override: 0.85
+
+# ADR-0009 confidence-gated dispatch. A gid is confirmed in the current run
+# iff any detection assigned to it meets:
+#  - face cost path with face_cos_sim ≥ confidence_face_threshold, OR
+#  - OSNet cost path with osnet_cos_sim ≥ confidence_osnet_abs_threshold AND
+#    margin to the next-best Identity ≥ confidence_osnet_margin_threshold.
+# Pre-confirmation detections route to the Fallback Anonymizer.
+# OSNet thresholds calibrated for ReID-pretrained osnet_x1_0 (torchreid
+# osnet_x1_0_msmt17). ReID cosines sit in [0.4, 0.7] with inter-person
+# margins typically < 0.05; the older 0.65 / 0.10 floors were tuned for
+# the ImageNet-pretrained backbone (which output [0.6, 0.9] / margins ~0.05).
+# Margin floor 0.02 from a 4-trace sweep of meeting_590-605 (~2900 osnet-path
+# detections): the empirical median margin sits near zero, so the floor is
+# the active gate against negative- and zero-margin Hungarian flips. 0.02
+# trims ~15-25% of the lowest-margin throughput; 0.03 trims ~25-37% with
+# no obvious natural breakpoint in between.
+confidence_face_threshold: 0.5
+confidence_osnet_abs_threshold: 0.50
+confidence_osnet_margin_threshold: 0.02
+# Per-video JSONL audit log (one file per video) of (assigned_sim, second_best_sim,
+# confirmed_via) per first-detection event. Empty disables logging.
+confidence_log_dir: ""
+
+# Per-identity dispatch filter. Empty list = no filtering (today's default:
+# every confirmed track goes to diffusion). Non-empty restricts inpaint to
+# confirmed tracks whose resolver name matches; everyone else falls to blur.
+inpaint_target_names: []
+
+# Minimum confident joints required to engage the pose ControlNet workflow.
+# Lower values let side-facing detections (fewer visible joints) still get
+# pose conditioning instead of falling back to the prompt-only workflow.
+pose_min_joints: 3
+
+# Adaptive regeneration gate (replaces the old fixed anon_interval). The
+# pipeline regenerates a person's diffusion only when:
+#   - this Identity has no cached crop yet, OR
+#   - frames since last regeneration ≥ anon_max_interval (ceiling so the
+#     cached crop can never drift far from current pose), OR
+#   - bbox IoU vs the last-regen bbox has dropped below the motion threshold.
+# Stationary people compose the cached anchor onto the current frame's mask
+# without hitting ComfyUI. Lower threshold / higher ceiling = more reuse.
+anon_max_interval: 10
+anon_motion_iou_threshold: 0.90
+
+# IP-Adapter-FaceID-Plus-v2 conditioning (ADR-0004). Two cross-attention
+# components — face (InsightFace embedding from Reference Crop) and body
+# (CLIP-vision) — driven by separate strength knobs so face fidelity tunes
+# independently of body coherence.
+#  - face_strength: IP-Adapter face component weight (the FaceID embedding).
+#  - body_strength: IP-Adapter body component weight (CLIP-vision).
+#  - lora_strength: FaceID-Plus-v2 LoRA weight on the model + clip path.
+# Three startup readiness checks (custom node, model file, LoRA file) all
+# hard-abort the pipeline if missing — same posture as ADR-0003.
+face_strength: 0.2
+body_strength: 0.5
+# FaceID-Plus-v2 LoRA is portrait-trained — at strength 1.0 it biases the
+# model toward standing-portrait composition; 0.7 keeps face identity while
+# leaving ControlNet OpenPose enough headroom on non-portrait poses.
+lora_strength: 0.3
+ip_adapter_model: "ip-adapter-faceid-plusv2_sd15.bin"
+ip_adapter_lora: "ip-adapter-faceid-plusv2_sd15_lora.safetensors"
+
+# F2: pose-aware face conditioning. When the keypoints suggest the head
+# is in profile or facing away, scale face_strength down so the frontal-
+# portrait Reference Crop doesn't override the head orientation that
+# ControlNet pose is trying to enforce.
+#  - face_strength_pose_adaptive: master switch.
+#  - face_strength_min_factor:    multiplier applied to face_strength on
+#                                 "facing away" frames (nose hidden, ≤1 eye).
+#                                 0.2 = 80% reduction; 1.0 disables the gate.
+face_strength_pose_adaptive: true
+face_strength_min_factor: 0.2
+
+# G2: affine-warp the cached crop to the current frame's keypoints on
+# regen-gate skip reuse (ghosting mitigation). Cheap cv2.warpAffine call
+# using shoulders/hips/face landmarks shared between regen-time and now.
+keypoint_warp_skip: true
+
+# IP-Adapter layer/schedule tuning. With the FaceID-Plus-v2 LoRA already
+# applied by the unified loader (lora_strength), the IP-Adapter node still
+# spatially conditions every cross-attention layer at every step by default
+# ("linear" / start_at=0.0) — strong enough to override ControlNet OpenPose
+# and reproduce the Reference Crop's composition (typically a standing
+# portrait) instead of the frame's actual pose (e.g. lying on a couch).
+#  - ipa_weight_type "style transfer" skips the middle (spatial-composition)
+#    layers — see cubiq IPAdapterPlus.py:308; SD1.5 layer set
+#    {0,1,2,3,9,10,11,12,13,14,15}.
+#  - ipa_start_at 0.2 lets ControlNet drive the first 20% of denoising
+#    (where the body silhouette is established) before identity
+#    conditioning re-engages.
+ipa_weight_type: "style transfer"
+ipa_start_at: 0.2
+ipa_end_at: 1.0
+
+# Face polish pass (ADR-0019). Chained second KSampler off the body pass's
+# output latent, gated to a tight head-keypoint-derived face mask intersected
+# with the SAM 3 person mask. Default off — flip on after validation
+# (cross-frame face-cosine variance drop ≥ recalibrated target, no Persona-
+# cosine mean regression, no uncanny mosaic failures). All knobs below take
+# effect only when enabled.
+#  - face_strength:        IPA face weight inside the face mask (1.0 = full hold)
+#  - body_strength:        IPA body (weight_faceidv2) — kept off at 0.0 since the
+#                          face polish pass only etches identity in a face-only mask
+#  - ipa_weight_type:      "linear" applies IPA to every cross-attn layer; the
+#                          face-only mask gates spatial scope without skipping layers
+#  - ipa_start_at/end_at:  full [0,1] range — no body-pass headroom needed
+#  - steps / cfg_scale / denoise: KSampler tuning for the polish pass (small mask
+#                          region + low denoise → fewer steps than the body pass)
+#  - face_bbox_pad_ratio:  expand InsightFace bbox by this ratio for hair/jaw context
+#  - min_face_size_px:     post-pad-and-transform-to-crop shorter side; below this
+#                          the face is too small for SD-1.5 polish to help — fall
+#                          through to body-pass-only output
+face_polish:
+  enabled: false
+  face_strength: 1.0
+  body_strength: 0.0
+  ipa_weight_type: "linear"
+  ipa_start_at: 0.0
+  ipa_end_at: 1.0
+  steps: 12
+  cfg_scale: 6.0
+  denoise: 0.25
+  face_bbox_pad_ratio: 0.25
+  min_face_size_px: 96
+
+# How long to wait for ComfyUI to complete one inpainting job (seconds).
+timeout: 60.0
+
+# Concurrent inpaint_frame: the orchestrator submits N persons' prompts to
+# ComfyUI in parallel and polls /history concurrently while ComfyUI executes
+# them serially on the GPU. Net effect: per-person HTTP upload/queue/poll
+# latency overlaps with GPU work on the previous person, cutting wall-clock
+# on multi-person frames by ~5–15% (empirically). Single-person frames are
+# unaffected (N=1 path is bit-equivalent to the legacy serial implementation).
+#
+# Cache writes (_prev_crops / _regen_gate) and paste-back remain sequential
+# on the main thread — no shared mutable state is touched concurrently.
+# requests.Session is thread-safe for HTTP-level use in CPython.
+#
+# Only min(max_concurrency, N_persons_needing_fresh_regen) threads actually
+# spawn per frame, so a high cap is free on light frames. Default 8 covers
+# bursty closed-world scenes (most of the 12 KPL identities visible at once
+# right after a chunk transition); measurement at 4 vs 1 showed the expected
+# 10% mean improvement on n_regen≥2 frames with no VRAM regression — see
+# tests/manual/analyze_batch_perf.py for the rerun protocol.
+max_concurrency: 8
+
+# When true, inpaint_frame emits a DEBUG-level line per frame listing the
+# paint order: `frame=N paint_order=[(gid, mask_area), ...]`. Use to confirm
+# a suspected paint-order regression correlates with paint sequence rather
+# than diffusion behavior. Off by default; cost is one log call per frame.
+paint_order_debug: false
+
+# End-of-run sweep of ComfyUI's input/ and output/ dirs for our per-call
+# PNGs. The on-disk copies are unused after fetch_image returns; without
+# this sweep, output/ accumulates one PNG per (frame × person) regen across
+# every run. Set cleanup_comfyui_prewarm: false to retain best-of-K
+# candidates for analysis.
+cleanup_comfyui_artifacts: true   # crop/mask/pose/ref in input/, anon_/spike_ in output/
+cleanup_comfyui_prewarm: true     # also sweep prewarm_gid*_seed* from output/
+
+# LAB color match at composite-time (ADR-0017). Sample target color stats
+# from a ring of *scene* pixels surrounding the mask (dilate(mask) − mask)
+# — never from the mask interior, which contains real-person pixels —
+# and shift the generated crop's mask-interior LAB statistics toward the
+# scene by `alpha`. Default off; flip on after validation-clip eyeball
+# review confirms no halo at mask-edge transitions.
+#  - alpha:        blend factor (0 = no-op, 1 = full match). 0.7 is the
+#                  default — large enough to track scene tint, small
+#                  enough to keep the synthetic crop's chroma identity.
+#  - ring_width_px morphological dilation radius defining the ring. 16
+#                  buys a usable scene sample without reaching across
+#                  the whole frame.
+#  - match_std     when true, also match per-channel std (more aggressive
+#                  shift, can over-stretch on low-variance gen crops).
+color_match:
+  enabled: true
+  alpha: 0.4
+  ring_width_px: 16
+  match_std: false
+
+# Set to a directory path to save per-identity crops for quality verification.
+# Files are named f{frame:06d}_gid{gid:04d}_{orig|gen}.png.
+# Leave empty to disable (no overhead).
+save_crops_dir: ""

@@ -1,0 +1,7 @@
+input: data/input_videos
+output: data/output_videos
+frames: data/frames
+temp: data/temp
+logs: outputs/logs
+debug_visualizations: outputs/debug_visualizations
+reports: outputs/reports

@@ -1,0 +1,3 @@
+start_time: null    # seconds; null = from beginning
+end_time: null      # seconds; null = to end
+fps: null           # null = match source fps

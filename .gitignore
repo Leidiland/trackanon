@@ -1,0 +1,49 @@
+# Model weights — download separately via scripts/download_weights.sh
+models/
+
+# Data
+data/input_videos/
+data/output_videos/
+data/frames/
+data/temp/
+
+# Outputs
+outputs/
+logs/
+
+# External vendored deps — install separately
+external/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+.pytest_cache/
+
+# Env
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scratch / local notes
+.scratch/
+.out-of-scope/
+temp.py
+temp_todo.txt
+*.tmp
+
+# Claude Code per-developer / runtime state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

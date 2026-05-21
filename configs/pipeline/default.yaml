@@ -1,0 +1,39 @@
+device: cuda          # cuda | cpu
+
+run_pose: true
+run_tracking: true
+run_anonymization: true
+visualize: false
+save_visualization: false
+
+# Debug instrumentation. When non-empty, the pipeline:
+#  - Enables IdentityResolver per-detection trace (gid, cosines, streak,
+#    assignment cost path) and dumps `<input.stem>.tracking.jsonl` +
+#    `<input.stem>.tracking.summary.txt` here at end of run.
+#  - Stage-level dispatch decisions for each track per frame land in the
+#    main DEBUG log (route taken, mask area ratio, mask score, confirmation
+#    state). Toggle requires --debug to surface.
+trace_dir: ""
+
+# Frame-0 manual gid bootstrap (ADR-0015). When enabled, the pipeline pauses
+# after IdentityResolver.update on frame 0 and lets the operator confirm or
+# correct the proposed sam3_obj_id → global_id mapping via a sidecar JSON.
+# Operator-assigned bindings carry an operator_assigned flag that bypasses
+# every face/OSNet demotion path and rides cross-chunk snapshots. Default off
+# so unattended / CI runs are unaffected.
+op_edit:
+  enabled: false
+  frame_0: true
+  artifact_dir: data/temp/op_edit
+  # Diagnostic only. True = keep an existing operator-edited JSON instead of
+  # overwriting with a fresh proposal. ADR-0015 rejects this as a default
+  # (cross-run poisoning surface). Use for repro runs, then revert.
+  reuse_existing: false
+  # web | stdin. web spins up a local FastAPI tab with clickable detection
+  # boxes; stdin keeps the original JSON-in-editor flow (still the canary
+  # for headless / CI use).
+  ui: web
+  web:
+    host: 127.0.0.1
+    port: 8765
+    open_browser: true

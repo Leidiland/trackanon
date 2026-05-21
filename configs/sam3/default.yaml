@@ -1,0 +1,169 @@
+name: SAM3
+
+# Prompt used in add_prompt(frame_index=0, text=...) at the start of each chunk.
+# Fixed for our pipeline; identification is handled downstream by KPL / FaceID.
+prompt: person
+
+# Frames per SAM 3 session. Smaller chunks → more chunk-boundary rebinds,
+# larger chunks → larger peak VRAM (per-chunk accumulated state) and longer
+# first-frame latency. 15 keeps the accumulated state bounded on a 16 GB
+# GPU with 6+ identities in scene; raise to 30+ for sparser scenes or
+# bigger GPUs. The per-iteration activation peak is governed by
+# num_maskmem × num_objects, not chunk_size, so this knob only addresses
+# the offloadable-state half of SAM 3's VRAM footprint.
+chunk_size: 15
+
+# Frames of overlap between successive chunks. IdentityResolver re-binds
+# sam3_obj_ids across the chunk boundary using these overlap frames as
+# carryover evidence. L=4 default; ~6.7 % SAM 3 compute overhead at
+# chunk_size=60 (each boundary frame is processed twice).
+overlap_L: 4
+
+# Output mask resolution (input pre-load + output mask are downscaled to this).
+# IMPORTANT: SAM 3's internal compute is fixed at image_size=1008
+# (model_builder.py:763), so this knob only affects the pre-load tensor +
+# output mask resolution — it does NOT reduce compute time. VRAM scales
+# with this knob though: propagate_in_video keeps every chunk frame's mask
+# tensor resident, so 1080 over a 30-frame chunk with 6+ identities can
+# tip the 16 GB budget over the edge into allocator thrash. 720 is the
+# safe default; override to 1080 when running scenes with ≤3 identities.
+output_mask_resolution: 720
+
+# Zero-detection mid-chunk recovery. SAM 3 propagation can emit an empty
+# out_obj_ids list for a single frame even on visually stable footage
+# (memory-attention transients, async-load races, decoder fp16 edges). When
+# that happens the anonymizer sees no tracks → frame passes through pristine
+# → privacy failure. The wrapper synthesizes ghost rows from the prior real
+# frame so binding keys survive; capped at `zero_frame_max_carry` consecutive
+# ghosts so a genuine disappearance is not masked forever. Ghost rows carry
+# `is_carry_forward=True` for downstream telemetry.
+zero_frame_max_carry: 3
+zero_frame_ghost_score_factor: 0.9
+
+# HF model id for build_sam3_video_predictor; weights auto-download on first
+# call into ~/.cache/huggingface. Pinned here for reproducibility.
+model_id: facebook/sam3
+
+# IdentityResolver knobs (migrated from configs/tracking/bytetrack.yaml in
+# Phase F). Identification is closed-world over the KPL gallery; FaceID is
+# the primary signal, OSNet is the fallback. See ADR-0005/0006/0007.
+resolver:
+  # KPL (Known Persons Library): one sub-folder per Identity, each containing
+  # at least one face-detectable image. Pipeline aborts at startup when this
+  # folder is missing or empty (ADR-0006).
+  kpl_root: data/known_persons
+
+  # Reference Crops: one PNG per Identity (filename = global_id.png).
+  # Loaded at startup, saved after each successful First Generation (ADR-0008).
+  reference_crop_dir: data/gallery/reference_crops
+
+  # FaceIDWrapper: minimum face width below which a face embedding is not
+  # trusted; the detection then falls back to OSNet+spatial cost.
+  min_face_width_px: 40
+
+  # Per-frame face contribution is weighted by det_score * sqrt(face_area /
+  # body_area) (ADR-0005 addendum (b)). det_score below this threshold causes
+  # the face to be treated as missing for this frame (no contribution to the
+  # running mean). Aligned with `face_quality_floor` so the same face-quality
+  # cutoff governs FaceIDWrapper admission, warm-gallery writes, and the
+  # Hungarian per-row face-cost gate.
+  min_face_det_score: 0.6
+
+  # HungarianAssigner cost knobs.
+  # emb_weight: weight on OSNet cosine in the no-face-mode pair cost.
+  #   pair_cost = emb_weight * (1 - osnet_cosine)
+  #             + (1 - emb_weight) * (1 - max(0, 1 - dist/spatial_scale))
+  emb_weight: 0.8
+  spatial_scale: 300.0
+
+  # Face-quality cost gating (ADR-0018). When a detection's InsightFace
+  # det_score is below this floor, the face term is dropped from that row's
+  # cost — the row decides on OSNet + spatial only. Defends profile views,
+  # motion-blurred faces, and distant detections proactively, before the
+  # `low_confidence_face_cosine` streak gate has accumulated harm. 0.0 (the
+  # default) is bit-equivalent to today's behaviour: no row is ever gated.
+  # 0.6 is the calibrated trigger point; raise to engage the gate.
+  face_quality_floor: 0.6
+
+  # Threshold below which a face match is treated as low-confidence. Feeds the
+  # per-track streak counter — a track is demoted to gid=-1 after
+  # `low_confidence_streak_max` consecutive face-bearing frames where the
+  # matched cosine stays below this value.
+  low_confidence_face_cosine: 0.4
+
+  # Face-embedding self-consistency gate: when a binding has accumulated >= 2
+  # face observations and a new sample with InsightFace det_score >=
+  # face_consistency_det_score_floor disagrees with the binding's running
+  # mean (cos < face_consistency_cos_floor), reset the binding's face
+  # accumulator. Catches SAM3 mask hand-overs that put a different physical
+  # person's face onto an obj_id mid-chunk — prevents warm-gallery
+  # contamination by the wrong identity. arcface cosine for same person
+  # across angles is typically >= 0.5, cross-person < 0.3.
+  face_consistency_cos_floor: 0.3
+  face_consistency_det_score_floor: 0.7
+
+  reid_input_size: [256, 128]
+
+  # Path to a torchreid OSNet ReID checkpoint (.pt). The wrapper builds
+  # osnet_x1_0 with imagenet weights by default, which produces weak
+  # person-discrimination embeddings; loading proper ReID weights restores
+  # inter-person margins. Run scripts/download_osnet_weights.py to fetch.
+  osnet_reid_weights: models/osnet/osnet_x1_0_msmt17.pt
+
+  # Number of consecutive face-bearing frames where the matched cosine stays
+  # below `low_confidence_face_cosine` required to demote a track to gid=-1.
+  # (Backstop.) A single high-confidence frame resets the streak.
+  low_confidence_streak_max: 5
+
+  # IdentityResolver face-sampling cadence. Face embedding is extracted every
+  # Nth frame per track (K=5 → once per 200 ms at 25 fps). SAM 3 mask
+  # continuity makes per-frame face extraction unnecessary.
+  face_sampling_K: 5
+
+  # Number of face observations required before a track's running embedding
+  # is considered confirmable via Hungarian. One high-quality face also
+  # confirms (see IdentityResolver.update).
+  face_confirm_M: 3
+
+  # Intra-chunk obj_id revival. When SAM 3 emits a brand-new sam3_obj_id whose
+  # bbox has high IoU with a recently-died binding's last_bbox (within
+  # `max_age_frames`), re-key the existing binding instead of creating a
+  # fresh one. Preserves operator_assigned + confirmed gid + accumulated
+  # face/OSNet evidence across SAM 3 obj_id churn, closing the post-dropout
+  # cascade without waiting for the next chunk boundary. iou_floor > 1.0
+  # disables.
+  intra_chunk_revival_iou_floor: 0.5
+  intra_chunk_revival_max_age_frames: 15
+
+  # Cross-chunk binding carry: IoU floor for matching an end-of-chunk
+  # snapshot to the next chunk's first-frame track. Mirror-image of the
+  # intra-chunk revival floor; sized to leave margin for jitter without
+  # admitting unrelated tracks.
+  partial_carry_iou_floor: 0.5
+
+  # OSNet column-loss demotion margin. Per frame, if the challenger track's
+  # OSNet cosine to my gid's centroid exceeds my own by more than this,
+  # increment the column-loss streak. Demotion fires when the streak hits
+  # `osnet_column_loss_streak_max`. 0.05 matches the typical inter-person
+  # OSNet margin band — tighter values demote more aggressively.
+  osnet_column_loss_margin: 0.05
+
+  # Warm Identity Gallery: per-gid runtime buffer of face/OSNet embeddings,
+  # additive to (never replacing) the frozen KPL centroids. Targets the
+  # cross-chunk re-entry case where the binding snapshot has been dropped
+  # but the runtime had already accumulated trustworthy evidence for the
+  # global_id. Default-on as a belt-and-suspenders rebind path for cases
+  # the IoU revival cannot catch (e.g., genuine re-entry from off-screen).
+  warm_gallery:
+    enabled: true
+    face_size: 10
+    osnet_size: 20
+    anchor_count: 3
+    osnet_trust_window_frames: 30
+    dedup_cosine: 0.95
+    warm_match_floor: 0.5
+    # Mask-sanity gates for op_edit'd writes — defend against SAM3 mask
+    # drift during occlusion polluting the operator-assigned gid's pool.
+    # 0.0 disables; defaults below match the issue PRD calibration starting points.
+    mask_sanity_iou_floor: 0.2
+    mask_sanity_jump_px_frac: 0.15

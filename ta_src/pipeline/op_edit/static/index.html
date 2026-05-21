@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>op-edit</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif;
+      background: #111;
+      color: #eee;
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      height: 100vh;
+    }
+    #stage {
+      position: relative;
+      overflow: auto;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #stage img { display: block; max-width: 100%; max-height: 100%; }
+    #stage svg {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+    }
+    #stage svg rect { pointer-events: all; cursor: pointer; }
+    /* match visualize.py text sizing: cv2 font_scale 0.7 ≈ 22 user-units
+       at 1080p, scaled with the frame by viewBox. */
+    #stage svg text {
+      font: 700 22px system-ui, -apple-system, Segoe UI, sans-serif;
+      paint-order: stroke fill;
+      stroke: rgba(0, 0, 0, 0.75);
+      stroke-width: 4px;
+      stroke-linejoin: round;
+      user-select: none;
+    }
+    aside {
+      border-left: 1px solid #333;
+      padding: 16px;
+      overflow-y: auto;
+      background: #181818;
+    }
+    h1 { font-size: 16px; margin: 0 0 12px; }
+    .obj {
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 10px;
+      background: #1f1f1f;
+    }
+    .obj.focused { outline: 2px solid #4af; }
+    .obj header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .swatch {
+      width: 14px; height: 14px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    .obj label { font-size: 12px; opacity: 0.7; }
+    select {
+      width: 100%;
+      padding: 6px;
+      background: #111;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    .proposed { font-size: 12px; opacity: 0.6; margin-top: 4px; }
+    footer {
+      position: sticky;
+      bottom: 0;
+      background: #181818;
+      padding-top: 12px;
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      flex: 1;
+      padding: 10px;
+      border: 0;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #apply { background: #2a7; color: #000; }
+    #abort { background: #a33; color: #fff; }
+    #status {
+      font-size: 12px;
+      opacity: 0.7;
+      margin-top: 8px;
+      min-height: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main id="stage">
+    <img id="frame" alt="frame" />
+    <svg id="overlay" preserveAspectRatio="none"></svg>
+  </main>
+  <aside>
+    <h1>op-edit · frame 0</h1>
+    <div id="objects"></div>
+    <footer>
+      <button id="apply">Apply</button>
+      <button id="abort">Abort</button>
+    </footer>
+    <div id="status"></div>
+  </aside>
+
+  <script>
+    const token = location.pathname.split("/").pop();
+    const $stage = document.getElementById("stage");
+    const $img = document.getElementById("frame");
+    const $svg = document.getElementById("overlay");
+    const $objects = document.getElementById("objects");
+    const $status = document.getElementById("status");
+
+    function paletteColor(i) {
+      const hue = (i * 47) % 360;
+      return `hsl(${hue} 70% 60%)`;
+    }
+
+    function setStatus(msg, isErr) {
+      $status.textContent = msg || "";
+      $status.style.color = isErr ? "#f88" : "";
+    }
+
+    async function load() {
+      const r = await fetch(`/pause/${token}/data`);
+      if (!r.ok) {
+        setStatus(`failed to load pause: ${r.status}`, true);
+        return;
+      }
+      const data = await r.json();
+      $img.src = data.image_url;
+      await new Promise(res => $img.complete ? res() : $img.addEventListener("load", res));
+      render(data);
+    }
+
+    function render(data) {
+      const w = $img.naturalWidth, h = $img.naturalHeight;
+      $svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      $svg.innerHTML = "";
+      $objects.innerHTML = "";
+
+      data.objects.forEach((obj, idx) => {
+        const color = paletteColor(obj.sam3_obj_id);
+        const [x1, y1, x2, y2] = obj.bbox;
+        const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        rect.setAttribute("x", x1);
+        rect.setAttribute("y", y1);
+        rect.setAttribute("width", x2 - x1);
+        rect.setAttribute("height", y2 - y1);
+        rect.setAttribute("fill", "none");
+        rect.setAttribute("stroke", color);
+        rect.setAttribute("stroke-width", "3");
+        rect.dataset.objId = obj.sam3_obj_id;
+        rect.addEventListener("click", () => focusObj(obj.sam3_obj_id));
+        $svg.appendChild(rect);
+
+        const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        const proposed = obj.proposed_gid >= 0
+          ? `${obj.proposed_gid}·${obj.proposed_name}`
+          : "?";
+        label.textContent = `obj ${obj.sam3_obj_id} → ${proposed}`;
+        label.setAttribute("x", x1);
+        label.setAttribute("y", Math.max(y1 - 6, 22));
+        label.setAttribute("fill", color);
+        $svg.appendChild(label);
+
+        const card = document.createElement("div");
+        card.className = "obj";
+        card.dataset.objId = obj.sam3_obj_id;
+        card.innerHTML = `
+          <header>
+            <span class="swatch" style="background:${color}"></span>
+            <strong>obj ${obj.sam3_obj_id}</strong>
+          </header>
+          <label>operator_gid</label>
+          <select>
+            <option value="-1">— skip (let face path decide) —</option>
+            ${data.known_persons.map(p =>
+              `<option value="${p.gid}" ${p.gid === obj.operator_gid ? "selected" : ""}>${p.gid} · ${p.name}</option>`
+            ).join("")}
+          </select>
+          <div class="proposed">resolver proposed: ${obj.proposed_gid >= 0
+            ? `${obj.proposed_gid} · ${obj.proposed_name}`
+            : "unknown"}</div>
+        `;
+        $objects.appendChild(card);
+      });
+    }
+
+    function focusObj(objId) {
+      document.querySelectorAll(".obj").forEach(el => {
+        el.classList.toggle("focused", el.dataset.objId === String(objId));
+      });
+      const card = document.querySelector(`.obj[data-obj-id="${objId}"]`);
+      if (card) card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+
+    function collect() {
+      return Array.from(document.querySelectorAll(".obj")).map(card => ({
+        sam3_obj_id: Number(card.dataset.objId),
+        operator_gid: Number(card.querySelector("select").value),
+      }));
+    }
+
+    document.getElementById("apply").addEventListener("click", async () => {
+      setStatus("applying…");
+      const r = await fetch(`/pause/${token}/apply`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ objects: collect() }),
+      });
+      if (r.ok) {
+        setStatus("applied — you can close this tab.");
+      } else {
+        const body = await r.json().catch(() => ({}));
+        setStatus(body.detail || `error ${r.status}`, true);
+      }
+    });
+
+    document.getElementById("abort").addEventListener("click", async () => {
+      if (!confirm("Abort the pipeline run?")) return;
+      setStatus("aborting…");
+      const r = await fetch(`/pause/${token}/abort`, { method: "POST" });
+      setStatus(r.ok ? "aborted — pipeline shutting down."
+                     : `error ${r.status}`, !r.ok);
+    });
+
+    load();
+  </script>
+</body>
+</html>

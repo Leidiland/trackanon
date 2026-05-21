@@ -1,0 +1,185 @@
+{
+  "_comment": [
+    "Runtime workflow: chained-KSampler face polish (ADR-0019).",
+    "",
+    "Two-pass graph sharing one VAEEncode and one VAEDecode. Pass 1 (body):",
+    "VAEEncode -> SetLatentNoiseMask(person_mask) -> ControlNetApplyAdvanced",
+    "(OpenPose, strength=0.9) -> KSampler (denoise=0.55, ~steps=20). Pass 2",
+    "(face polish): SetLatentNoiseMask(face_mask) consumes the body-pass",
+    "latent directly -> KSampler (denoise=0.25, steps=12, NO ControlNet).",
+    "",
+    "IP-Adapter is injected at runtime via ipadapter_injector.inject(",
+    "apply_configs=...) with one shared IPAdapterUnifiedLoaderFaceID and",
+    "two IPAdapterFaceID apply nodes -- one per KSampler. The static",
+    "template intentionally omits IPA nodes (see ADR-0004).",
+    "",
+    "Required ComfyUI models:",
+    "  checkpoints/Realistic_Vision_V6.0_NV_B1_fp16.safetensors",
+    "  vae/vae-ft-mse-840000-ema-pruned.safetensors",
+    "  controlnet/control_v11p_sd15_openpose.pth"
+  ],
+  "_node_ids": {
+    "positive":       "3",
+    "negative":       "4",
+    "load_image":     "5",
+    "load_mask":      "6",
+    "load_pose":      "13",
+    "controlnet":     "14",
+    "vae_encode":     "16",
+    "set_mask_body":  "17",
+    "ksampler":       "9",
+    "ksampler_body":  "9",
+    "load_face_mask": "26",
+    "set_mask_face":  "28",
+    "ksampler_face":  "29",
+    "vae_decode":     "10",
+    "save_image":     "11"
+  },
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "Realistic_Vision_V6.0_NV_B1_fp16.safetensors"
+    }
+  },
+  "15": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "vae-ft-mse-840000-ema-pruned.safetensors"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "a person, neutral appearance, warm skin tone, soft natural light",
+      "clip": ["1", 1]
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "deformed, artifacts, blurry, extra limbs, low quality, blue skin, grey skin, washed out",
+      "clip": ["1", 1]
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "crop_placeholder.png"
+    }
+  },
+  "6": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "mask_placeholder.png"
+    }
+  },
+  "7": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": ["6", 0],
+      "channel": "red"
+    }
+  },
+  "16": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": ["5", 0],
+      "vae":    ["15", 0]
+    }
+  },
+  "17": {
+    "class_type": "SetLatentNoiseMask",
+    "inputs": {
+      "samples": ["16", 0],
+      "mask":    ["7", 0]
+    }
+  },
+  "12": {
+    "class_type": "ControlNetLoader",
+    "inputs": {
+      "control_net_name": "control_v11p_sd15_openpose.pth"
+    }
+  },
+  "13": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "pose_placeholder.png"
+    }
+  },
+  "14": {
+    "class_type": "ControlNetApplyAdvanced",
+    "inputs": {
+      "positive":      ["3", 0],
+      "negative":      ["4", 0],
+      "control_net":   ["12", 0],
+      "image":         ["13", 0],
+      "strength":      0.9,
+      "start_percent": 0.0,
+      "end_percent":   1.0
+    }
+  },
+  "9": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model":        ["1", 0],
+      "positive":     ["14", 0],
+      "negative":     ["14", 1],
+      "latent_image": ["17", 0],
+      "seed":         42,
+      "steps":        20,
+      "cfg":          7.0,
+      "sampler_name": "dpmpp_2m",
+      "scheduler":    "karras",
+      "denoise":      0.55
+    }
+  },
+  "26": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "face_mask_placeholder.png"
+    }
+  },
+  "27": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": ["26", 0],
+      "channel": "red"
+    }
+  },
+  "28": {
+    "class_type": "SetLatentNoiseMask",
+    "inputs": {
+      "samples": ["9", 0],
+      "mask":    ["27", 0]
+    }
+  },
+  "29": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model":        ["1", 0],
+      "positive":     ["3", 0],
+      "negative":     ["4", 0],
+      "latent_image": ["28", 0],
+      "seed":         42,
+      "steps":        12,
+      "cfg":          6.0,
+      "sampler_name": "dpmpp_2m",
+      "scheduler":    "karras",
+      "denoise":      0.25
+    }
+  },
+  "10": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["29", 0],
+      "vae":     ["15", 0]
+    }
+  },
+  "11": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images":          ["10", 0],
+      "filename_prefix": "anon_output"
+    }
+  }
+}

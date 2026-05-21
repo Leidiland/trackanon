@@ -1,0 +1,8 @@
+defaults:
+  - pose: vitpose
+  - anonymization: diffusion
+  - sam3: default
+  - temporal: default
+  - paths: default
+  - pipeline: default
+  - _self_

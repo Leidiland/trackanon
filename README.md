@@ -10,7 +10,7 @@
 
 ## What it does
 
-Offline pipeline that anonymizes video by **replacing** every person or a smaller subset — with a blurred fallback. Each individual is detected, identified against a **Known Person Library** (KPL) of real photos, and re-rendered as a fictional but consistent diffusion-generated appearance. The same person keeps the same fabricated look across occlusions, chunks, and re-runs.
+Offline pipeline that anonymizes video by **replacing** every person, or a smaller subset, with a synthetic persona. Each individual is detected, identified against a **Known Person Library** (KPL) of real photos, and re-rendered as a fictional but consistent diffusion-generated appearance. The same person keeps the same fabricated look across occlusions, chunks, and re-runs.
 
 ## How it works
 

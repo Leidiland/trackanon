@@ -53,8 +53,7 @@ pip install -r requirements.txt
 
 # 4. Weights — OSNet ReID + SAM 3 + InsightFace buffalo_l
 python scripts/download_weights.py
-# VACE backend weights (Wan2.1-VACE UNet/CLIP/VAE) install into the portable
-# VACE ComfyUI under external/comfyui-vace — run scripts/setup_comfyui_vace.sh.
+# VACE backend weights (Wan2.1-VACE UNet/CLIP/VAE) install into the portable.
 ```
 
 ## Usage

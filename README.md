@@ -10,13 +10,13 @@
 
 ## What it does
 
-Offline pipeline that anonymizes video by **replacing** every person — not blurring them. Each individual is detected, identified against a **Known Person Library** (KPL) of real photos, and re-rendered as a fictional but consistent diffusion-generated appearance. The same Person keeps the same fabricated look across occlusions, chunks, and re-runs.
+Offline pipeline that anonymizes video by **replacing** every person or a smaller subset — with a blurred fallback. Each individual is detected, identified against a **Known Person Library** (KPL) of real photos, and re-rendered as a fictional but consistent diffusion-generated appearance. The same person keeps the same fabricated look across occlusions, chunks, and re-runs.
 
 ## How it works
 
 ```
   Pass 1 — track
-  video ──► SAM 3 chunked segmentation (60-frame sessions)
+  video ──► SAM 3 chunked segmentation (25-frame sessions)
               │
               ▼
         IdentityResolver  ──►  face (InsightFace) + body (OSNet) evidence
@@ -35,7 +35,7 @@ Offline pipeline that anonymizes video by **replacing** every person — not blu
                     unconfirmed gids, mask-quality failures, unpainted silhouettes)
 ```
 
-Closed-world by design: every Identity is seeded from KPL at startup with a frozen face centroid, OSNet appearance centroid, captioned Persona prompt, and a synthetic **Reference Crop**. The Reference Crop is a pre-generated synthetic image loaded from disk; VACE anchors each window's appearance to it, so the real KPL pixels never reach the generation stage.
+Closed-world by design: every identity is seeded from KPL at startup with a frozen face centroid, OSNet appearance centroid, captioned persona prompt, and a synthetic **Reference Crop**. The reference crop is a pre-generated synthetic image loaded from disk; VACE anchors each window's appearance to it, so the real KPL pixels never reach the generation stage.
 
 ## Setup
 
@@ -65,12 +65,12 @@ python scripts/download_weights.py
 python scripts/run_pipeline.py --input data/input_videos/example.mp4
 ```
 
-The pipeline scans `data/known_persons/` at startup, seeds one Identity per sub-folder (sorted, 1-indexed `global_id`), loads each Identity's pre-generated Reference Crop from `data/gallery/reference_crops/`, then tracks the clip (Pass 1) and renders each confirmed gid with VACE (Pass 2).
+The pipeline scans `data/known_persons/` at startup, seeds one identity per sub-folder (sorted, 1-indexed `global_id`), loads each identity's pre-generated reference crop from `data/gallery/reference_crops/`, then tracks the clip (Pass 1) and renders each confirmed gid with VACE (Pass 2).
 
 ### Using your own people
 
-The repo ships a ready-to-run example KPL with pre-generated Reference Crops. The pipeline **consumes** Reference Crops as fixed synthetic images — it does not generate them. To anonymize your own footage, add one folder of face photos per person under `data/known_persons/<name>/`, and supply a matching synthetic `data/gallery/reference_crops/<global_id>.png` produced by any image generator (an optional `<global_id>.prompt.txt` overrides the VACE prompt for that Identity).
+The repo ships a ready-to-run example KPL with pre-generated reference crops. The pipeline **consumes** reference crops as fixed synthetic images — it does not generate them at the moment. To anonymize your own footage, add one folder of face photos per person under `data/known_persons/<name>/`, and supply a matching synthetic `data/gallery/reference_crops/<global_id>.png` produced by any image generator (an optional `<global_id>.prompt.txt` overrides the VACE prompt for that identity).
 
 ## License
 
-Released under the [MIT License](LICENSE). The vendored dependencies (SAM 3, ComfyUI, Wan-VACE weights) are fetched at setup time under their own licenses and are not redistributed here.
+Released under the [MIT License](LICENSE).

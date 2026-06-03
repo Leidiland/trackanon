@@ -23,15 +23,7 @@ _DIRS = [
     "data/gallery/kpl_centroids",
     "data/input_videos",
     "data/output_videos",
-    "data/frames",
-    "data/temp/op_edit",
-    "data/temp/track_cache",
-    "data/debug",
     "data/examples",
-    "outputs/debug_visualizations",
-    "outputs/eval/cache",
-    "outputs/logs",
-    "outputs/reports",
     "logs",
 ]
 

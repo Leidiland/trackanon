@@ -1,7 +1,10 @@
-"""1€ filter for ViTPose keypoints — per-`global_id` per-joint smoothing.
+"""Temporal smoothing of per-frame DWpose keypoints (One Euro filter).
 
-Velocity-adaptive cutoff: low velocity → low cutoff (smooth), high velocity →
-high cutoff (responsive). Same per-frame cost as EMA. See ADR-0014.
+Runs in full-frame pixel coordinates, keyed per track, so a near-stationary
+person stops jittering while a moving one keeps up without lag. Time is the
+frame index, so cutoff frequencies are in cycles-per-frame (sub-Nyquist
+< 0.5). Feeds the TPS warp / pose gate / visualization; the ControlNet
+conditioning skeleton is rendered elsewhere and untouched.
 """
 from __future__ import annotations
 
@@ -11,117 +14,111 @@ import numpy as np
 
 
 def _alpha(cutoff: float, dt: float) -> float:
-    """1st-order low-pass smoothing factor at the given cutoff frequency."""
     tau = 1.0 / (2.0 * math.pi * cutoff)
     return 1.0 / (1.0 + tau / dt)
 
 
-class _JointFilter:
-    """Per-joint 1€ filter state."""
+class _OneEuroBank:
+    """Vectorized One Euro filter over an (N, 2) keypoint array."""
 
     def __init__(self, min_cutoff: float, beta: float, d_cutoff: float):
-        self.min_cutoff = float(min_cutoff)
-        self.beta = float(beta)
-        self.d_cutoff = float(d_cutoff)
-        self.x_prev: np.ndarray | None = None
-        self.dx_prev: np.ndarray | None = None
-        self.t_prev: int | None = None
+        self._min_cutoff = min_cutoff
+        self._beta = beta
+        self._d_cutoff = d_cutoff
+        self._x_prev: np.ndarray | None = None
+        self._dx_prev: np.ndarray | None = None
+        self._init: np.ndarray | None = None  # per-keypoint, seen-valid-once
 
-    def step(self, xy: np.ndarray, t: int) -> np.ndarray:
-        if self.t_prev is None:
-            self.x_prev = xy.astype(np.float64).copy()
-            self.dx_prev = np.zeros(2, dtype=np.float64)
-            self.t_prev = int(t)
-            return xy.astype(np.float32)
-        dt = max(1, int(t) - int(self.t_prev))
-        raw_dx = (xy.astype(np.float64) - self.x_prev) / float(dt)
-        a_d = _alpha(self.d_cutoff, float(dt))
-        smoothed_dx = a_d * raw_dx + (1.0 - a_d) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * float(np.linalg.norm(smoothed_dx))
-        a = _alpha(cutoff, float(dt))
-        smoothed_x = a * xy.astype(np.float64) + (1.0 - a) * self.x_prev
-        self.x_prev = smoothed_x
-        self.dx_prev = smoothed_dx
-        self.t_prev = int(t)
-        return smoothed_x.astype(np.float32)
+    def filter(self, xy: np.ndarray, valid: np.ndarray, dt: float) -> np.ndarray:
+        """Smooth the valid rows; hold the invalid ones at their last value
+        (and leave their filter state untouched so an occluded/low-conf
+        reading can never poison the running estimate)."""
+        xy = xy.astype(np.float64)
+        if self._x_prev is None:
+            self._x_prev = xy.copy()
+            self._dx_prev = np.zeros_like(xy)
+            self._init = valid.copy()
+            return xy.copy()
 
-    def predict(self) -> np.ndarray | None:
-        if self.x_prev is None:
-            return None
-        return self.x_prev.astype(np.float32)
+        dx = (xy - self._x_prev) / dt
+        a_d = _alpha(self._d_cutoff, dt)
+        edx = self._dx_prev + a_d * (dx - self._dx_prev)
+        cutoff = self._min_cutoff + self._beta * np.abs(edx)
+        a = 1.0 / (1.0 + (1.0 / (2.0 * math.pi * cutoff)) / dt)
+        x_hat = self._x_prev + a * (xy - self._x_prev)
+
+        out = self._x_prev.copy()
+        filt = valid & self._init           # valid & seen before → smooth
+        out[filt] = x_hat[filt]
+        self._x_prev[filt] = x_hat[filt]
+        self._dx_prev[filt] = edx[filt]
+        seed = valid & ~self._init          # first valid sighting → seed
+        out[seed] = xy[seed]
+        self._x_prev[seed] = xy[seed]
+        self._dx_prev[seed] = 0.0
+        self._init[seed] = True
+        return out
 
 
 class KeypointSmoother:
     def __init__(
         self,
         *,
-        min_cutoff: float = 1.0,
-        beta: float = 0.007,
-        d_cutoff: float = 1.0,
-        conf_floor: float = 0.3,
-        gap_reset_frames: int = 30,
+        min_cutoff: float,
+        beta: float,
+        d_cutoff: float,
+        conf_floor: float,
+        reset_after_missing_frames: int,
     ):
-        self.min_cutoff = float(min_cutoff)
-        self.beta = float(beta)
-        self.d_cutoff = float(d_cutoff)
-        self.conf_floor = float(conf_floor)
-        self.gap_reset_frames = int(gap_reset_frames)
-        self._states: dict[tuple[int, int], _JointFilter] = {}
-        self._last_frame: dict[int, int] = {}
-
-    def smooth(
-        self,
-        global_id: int,
-        keypoints: np.ndarray,
-        frame_idx: int,
-    ) -> np.ndarray:
-        out = np.asarray(keypoints, dtype=np.float32).copy()
-        if global_id in self._last_frame:
-            gap = int(frame_idx) - int(self._last_frame[global_id])
-            if gap > self.gap_reset_frames:
-                self.reset(global_id)
-        self._last_frame[global_id] = int(frame_idx)
-        for k in range(out.shape[0]):
-            conf = float(out[k, 2])
-            key = (int(global_id), int(k))
-            state = self._states.get(key)
-            if state is None:
-                state = _JointFilter(self.min_cutoff, self.beta, self.d_cutoff)
-                self._states[key] = state
-            if conf >= self.conf_floor:
-                xy = np.array([out[k, 0], out[k, 1]], dtype=np.float64)
-                smoothed = state.step(xy, int(frame_idx))
-                out[k, 0] = float(smoothed[0])
-                out[k, 1] = float(smoothed[1])
-            else:
-                predicted = state.predict()
-                if predicted is not None:
-                    out[k, 0] = float(predicted[0])
-                    out[k, 1] = float(predicted[1])
-        return out
-
-    def reset(self, global_id: int) -> None:
-        gid = int(global_id)
-        self._states = {k: v for k, v in self._states.items() if k[0] != gid}
-        self._last_frame.pop(gid, None)
-
-    def reset_all(self) -> None:
-        self._states.clear()
-        self._last_frame.clear()
+        self._min_cutoff = float(min_cutoff)
+        self._beta = float(beta)
+        self._d_cutoff = float(d_cutoff)
+        self._conf_floor = float(conf_floor)
+        self._reset_gap = int(reset_after_missing_frames)
+        self._banks: dict[tuple, _OneEuroBank] = {}
+        self._last_frame: dict[tuple, int] = {}
 
     @classmethod
     def from_config(cls, cfg) -> "KeypointSmoother | None":
-        if cfg is None:
-            return None
-        sm = cfg.get("smoother", None) if hasattr(cfg, "get") else None
-        if sm is None:
-            return None
-        if not bool(sm.get("enabled", False)):
+        """Build from the pose `smoothing:` block. None when absent or
+        explicitly disabled (feature-flag on by default)."""
+        if cfg is None or not bool(cfg.get("enabled", False)):
             return None
         return cls(
-            min_cutoff=float(sm.get("min_cutoff", 1.0)),
-            beta=float(sm.get("beta", 0.007)),
-            d_cutoff=float(sm.get("d_cutoff", 1.0)),
-            conf_floor=float(sm.get("conf_floor", 0.3)),
-            gap_reset_frames=int(sm.get("gap_reset_frames", 30)),
+            min_cutoff=float(cfg.get("min_cutoff", 0.1)),
+            beta=float(cfg.get("beta", 0.02)),
+            d_cutoff=float(cfg.get("d_cutoff", 1.0)),
+            conf_floor=float(cfg.get("conf_floor", 0.3)),
+            reset_after_missing_frames=int(cfg.get("reset_after_missing_frames", 5)),
         )
+
+    def smooth(self, track_key, keypoints: np.ndarray, frame_idx: int) -> np.ndarray:
+        bank_key = (track_key, keypoints.shape[0])
+        last = self._last_frame.get(bank_key)
+        if last is not None and (frame_idx - last) > self._reset_gap:
+            self._banks.pop(bank_key, None)  # re-entry → start fresh
+        bank = self._banks.get(bank_key)
+        if bank is None:
+            bank = _OneEuroBank(self._min_cutoff, self._beta, self._d_cutoff)
+            self._banks[bank_key] = bank
+        dt = float(frame_idx - last) if last is not None else 1.0
+        if dt <= 0:
+            dt = 1.0
+        self._last_frame[bank_key] = frame_idx
+
+        valid = keypoints[:, 2] >= self._conf_floor
+        out = keypoints.copy()
+        out[:, :2] = bank.filter(keypoints[:, :2], valid, dt)
+        return out
+
+    def apply(self, results: list[dict], detections: list[dict], frame_idx: int) -> None:
+        """Smooth `poser.run()` results in place, keyed per track. Confirmed
+        tracks key on global_id; unmatched (gid=-1) key on sam3_obj_id so they
+        don't share filter state. Entries with no keypoints are left as-is."""
+        for res, det in zip(results, detections):
+            gid = det.get("global_id", -1)
+            key = gid if gid != -1 else ("obj", det.get("sam3_obj_id"))
+            for field in ("keypoints", "keypoints_full"):
+                kps = res.get(field)
+                if kps is not None:
+                    res[field] = self.smooth((key, field), kps, frame_idx)

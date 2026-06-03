@@ -5,10 +5,14 @@ Session flags: async_loading_frames, offload_video_to_cpu, offload_state_to_cpu
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+_log = logging.getLogger(__name__)
 
 
 def apply_zero_frame_carry_forward(
@@ -81,12 +85,16 @@ class SAM3ChunkedStage:
         prompt: str = "person",
         zero_frame_max_carry: int = 3,
         zero_frame_ghost_score_factor: float = 0.9,
+        profile_vram: bool = False,
     ) -> None:
         self._predictor = predictor
         self._prompt = prompt
         self._zero_frame_max_carry = int(zero_frame_max_carry)
         self._zero_frame_ghost_score_factor = float(zero_frame_ghost_score_factor)
         self._session_id: str | None = None
+        self._profile_vram = bool(profile_vram)
+        # Populated when profile_vram=True; one dict per process_chunk call.
+        self.vram_log: list[dict] = []
 
     @classmethod
     def from_config(cls, cfg, device: str) -> "SAM3ChunkedStage":
@@ -115,11 +123,17 @@ class SAM3ChunkedStage:
             zero_frame_ghost_score_factor=float(
                 get("zero_frame_ghost_score_factor", 0.9),
             ),
+            profile_vram=bool(get("profile_vram", False)),
         )
 
     def process_chunk(
         self, chunk_dir: Path, base_frame_idx: int
     ) -> list[list[dict]]:
+        if self._profile_vram:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
         start = self._predictor.handle_request({
             "type": "start_session",
             "resource_path": str(chunk_dir),
@@ -141,6 +155,29 @@ class SAM3ChunkedStage:
             "session_id": self._session_id,
         }):
             rows_per_frame.append(_rows_from_outputs(response["outputs"]))
+
+        if self._profile_vram:
+            import torch
+            if torch.cuda.is_available():
+                n_frames = len(rows_per_frame)
+                # Max obj count across the chunk — proxies "people on screen".
+                n_obj_max = max((len(r) for r in rows_per_frame), default=0)
+                peak_alloc = torch.cuda.max_memory_allocated() / 1e9
+                peak_reserved = torch.cuda.max_memory_reserved() / 1e9
+                record = {
+                    "base_frame_idx": int(base_frame_idx),
+                    "n_frames": int(n_frames),
+                    "n_obj_max": int(n_obj_max),
+                    "peak_alloc_gb": float(peak_alloc),
+                    "peak_reserved_gb": float(peak_reserved),
+                }
+                self.vram_log.append(record)
+                _log.info(
+                    "sam3 vram: base=%d n_frames=%d n_obj=%d peak_alloc=%.2fGB peak_reserved=%.2fGB",
+                    record["base_frame_idx"], record["n_frames"], record["n_obj_max"],
+                    record["peak_alloc_gb"], record["peak_reserved_gb"],
+                )
+
         # Zero-detection frames mid-chunk get ghost rows from the prior frame
         # so bindings keep their sam3_obj_id keys and anonymization stays
         # applied. Cap prevents masking a genuine disappearance.

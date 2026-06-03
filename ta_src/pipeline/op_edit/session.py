@@ -1,4 +1,4 @@
-"""ADR-0015 op-edit frame-0 bootstrap: pause once at frame 0 so the operator
+"""Op-edit frame-0 bootstrap: pause once at frame 0 so the operator
 can correct the resolver's proposed sam3_obj_id → global_id mapping before
 identity-conditioned generation locks in.
 
@@ -39,8 +39,8 @@ class OpEditSession:
         stdin: Optional[Callable[[str], str]] = None,
         daemon: Optional["OpEditWebDaemon"] = None,
         # Diagnostic: reuse a previously-edited sidecar JSON instead of
-        # overwriting it with a fresh proposal. ADR-0015 rejects this as a
-        # default (inverts the trust model); only set true for repro runs.
+        # overwriting it with a fresh proposal. Inverts the trust model, so
+        # not a default; only set true for repro runs.
         reuse_existing: bool = False,
     ) -> None:
         self._gallery = gallery

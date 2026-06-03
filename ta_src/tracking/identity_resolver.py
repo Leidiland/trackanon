@@ -13,10 +13,54 @@ from pathlib import Path
 from typing import Optional
 
 
+_INHERIT_INFEASIBLE = 1e6
+# Cross-chunk inherit appearance blend: face is trusted enough to reorder
+# feasible IoU pairs (breaks the boundary identity swap); OSNet stays a weak
+# tiebreak only, since body cost is near-inert.
+_INHERIT_FACE_WEIGHT = 0.5
+_INHERIT_OSNET_WEIGHT = 0.1
+
+
+_INHERIT_MASK_FLOOR = 0.1  # min mask IoU for a mask-disambiguated inherit
+_INHERIT_MASK_CONTINUITY_FLOOR = 0.5  # mask IoU that rescues a sub-bbox-floor inherit
+_OSNET_TIE_MARGIN = 0.03  # a free-gid osnet confirm must win KPL by this margin
+
+
+def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    inter = int(np.logical_and(a, b).sum())
+    if inter == 0:
+        return 0.0
+    return inter / int(np.logical_or(a, b).sum())
+
+
+def _unit_mean(emb_sum: np.ndarray, weight_total: float) -> Optional[np.ndarray]:
+    if weight_total <= 0:
+        return None
+    mean = emb_sum / weight_total
+    n = float(np.linalg.norm(mean))
+    return mean / n if n > 0 else mean
+
+
+def _inherit_appearance_bonus(
+    carry: "_ChunkBoundarySnapshot",
+    new_face: Optional[np.ndarray],
+    new_osnet: Optional[np.ndarray],
+) -> float:
+    # Face when both sides have it (trusted); else OSNet as a weak tiebreak.
+    snap_face = _unit_mean(carry.face_emb_sum, carry.face_weight_total)
+    if new_face is not None and snap_face is not None:
+        return _INHERIT_FACE_WEIGHT * float(np.dot(new_face, snap_face))
+    snap_osnet = _unit_mean(carry.osnet_emb_sum, carry.osnet_weight_total)
+    if new_osnet is not None and snap_osnet is not None:
+        return _INHERIT_OSNET_WEIGHT * float(np.dot(new_osnet, snap_osnet))
+    return 0.0
+
+
 def _module_log() -> logging.Logger:
     return logging.getLogger(__name__)
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from ta_src.anonymization.confidence_gate import evaluate as evaluate_gate
 from ta_src.tracking.hungarian_assigner import AssignmentInfo, Detection
@@ -50,7 +94,14 @@ class TrackBinding:
     blocked_gids: set[int] = field(default_factory=set)
     frames_seen: int = 0  # controls K-sampling cadence
     last_bbox: Optional[tuple] = None
+    # Last full-frame silhouette — disambiguates the chunk-start inherit when two
+    # bodies' bboxes overlap but their masks are disjoint (the duplicate-gid swap).
+    last_mask: Optional[np.ndarray] = None
     last_seen_frame_idx: int = -1
+    # Frame index of the most recent frame InsightFace sampled a face for this
+    # binding. Debounces the K-cadence so the skeleton face-gate sees sustained
+    # orientation, not per-frame sampling noise. -1 = no face ever sampled.
+    last_face_frame_idx: int = -1
     # Fresh binding that did not inherit a snapshot: bbox carries no signal,
     # so the assigner drops the spatial blend on no-face confirmation cost.
     long_gap: bool = True
@@ -81,9 +132,12 @@ class TrackBinding:
 
 
 @dataclass
-class _PartialEvidenceCarry:
-    """Chunk-end snapshot — matched into next chunk by bbox IoU for transparent boundaries."""
+class _ChunkBoundarySnapshot:
+    """Full binding state captured at chunk end — matched into the next chunk by
+    bbox IoU (mask IoU when silhouettes are available) so a confirmed gid
+    survives the SAM3 obj_id renumber."""
     last_bbox: tuple[float, float, float, float]
+    last_mask: Optional[np.ndarray]
     face_emb_sum: np.ndarray
     face_weight_total: float
     n_face_observations: int
@@ -126,6 +180,9 @@ class IdentityResolver:
         partial_carry_iou_floor: float = 0.5,
         face_consistency_cos_floor: float = 0.3,
         face_consistency_det_score_floor: float = 0.7,
+        locality_max_jump_px: float = 300.0,
+        locality_max_stale_frames: int = 5,
+        locality_max_speed_px: float = 100.0,
     ) -> None:
         self._face = face_wrapper
         self._gallery = gallery
@@ -141,6 +198,14 @@ class IdentityResolver:
         self._min_face_det_score = min_face_det_score
         self._face_consistency_cos_floor = float(face_consistency_cos_floor)
         self._face_consistency_det_score_floor = float(face_consistency_det_score_floor)
+        # Locality gate: a gid seen <= N frames ago can't (re)bind to a box more
+        # than M px from where it was last seen — physically impossible motion.
+        self._locality_max_jump_px = float(locality_max_jump_px)
+        self._locality_max_stale_frames = int(locality_max_stale_frames)
+        self._locality_max_speed_px = float(locality_max_speed_px)
+        # gid -> (frame_idx, (cx, cy)) last frame each gid held a detection.
+        self._gid_last_seen: dict[int, tuple[int, tuple[float, float]]] = {}
+        self._current_frame_idx: int = -1
 
         if warm_gallery_enabled:
             self._warm_gallery: WarmIdentityGallery | None = WarmIdentityGallery(
@@ -171,23 +236,49 @@ class IdentityResolver:
         self._intra_revival_max_age = int(intra_chunk_revival_max_age_frames)
         # Cross-chunk carry: leaves margin for jitter without admitting unrelated tracks.
         self._partial_carry_iou_floor = float(partial_carry_iou_floor)
+        # gids the operator assigned this video; any track that re-binds to one
+        # re-acquires operator stickiness (survives warm-rebind handoffs) without
+        # loosening any geometric gate.
+        self._operator_gids: set[int] = set()
 
         self._chunk_id: int = -1
         self._tracks: dict[int, TrackBinding] = {}  # keyed by sam3_obj_id
         # Cross-chunk state snapshots; matched by bbox IoU on the next chunk's first frame.
-        self._partial_carryover: list[_PartialEvidenceCarry] = []
+        self._carryover: list[_ChunkBoundarySnapshot] = []
         self._frames_into_chunk: int = 0
 
         self._trace_log: list[dict] | None = None
         self._gid_prev_by_track: dict[int, int] = {}
         self._first_frame_by_track: dict[int, int] = {}
         self._chunk_boundary_pending: bool = False
+        # obj_id -> why a confirm-eligible track did not bind this frame (trace).
+        self._confirm_abstain: dict[int, str] = {}
 
     def set_confidence_log(self, log) -> None:
         """Late-wire the shared ConfidenceLog (constructed by AnonymizationStage)."""
         self._confidence_log = log
         if self._warm_writer is not None:
             self._warm_writer.set_confidence_log(log)
+
+    def reset_video(self) -> None:
+        """Clear per-video state at a video boundary. The resolver is reused
+        across every video in a batch run; without this, chunk snapshots and
+        per-track history bleed from one video into the next (and the trace
+        buffer grows unbounded across the whole run)."""
+        if self._trace_log is not None:
+            self._trace_log = []
+        self._gid_prev_by_track.clear()
+        self._first_frame_by_track.clear()
+        self._chunk_id = -1
+        self._tracks = {}
+        self._carryover = []
+        self._frames_into_chunk = 0
+        self._chunk_boundary_pending = False
+        self._gid_last_seen = {}
+        self._current_frame_idx = -1
+        self._operator_gids = set()
+        if self._warm_writer is not None:
+            self._warm_writer.reset_video()
 
     def start_chunk(self, chunk_id: int) -> None:
         if self._chunk_id >= 0:
@@ -198,9 +289,10 @@ class IdentityResolver:
             last_frame = max(
                 b.last_seen_frame_idx for b in self._tracks.values()
             )
-            self._partial_carryover = [
-                _PartialEvidenceCarry(
+            self._carryover = [
+                _ChunkBoundarySnapshot(
                     last_bbox=tuple(b.last_bbox),
+                    last_mask=b.last_mask,
                     face_emb_sum=b.face_emb_sum.copy(),
                     face_weight_total=b.face_weight_total,
                     n_face_observations=b.n_face_observations,
@@ -233,6 +325,7 @@ class IdentityResolver:
         sam3_rows: list[dict],
         frame_idx: int,
     ) -> list[dict]:
+        self._current_frame_idx = frame_idx
         if self._chunk_boundary_pending:
             self._record_chunk_boundary(frame_idx)
             self._chunk_boundary_pending = False
@@ -243,6 +336,23 @@ class IdentityResolver:
         # transferring the live binding to the new key keeps operator_assigned
         # and confirmed gid intact without waiting for the chunk boundary.
         self._revive_died_bindings(sam3_rows, frame_idx)
+
+        # Neighbour-subtracted face crops — shared by the inherit's on-demand
+        # appearance sample and Pass 1's accumulation (keeps a crosser's face
+        # out of both).
+        face_remove_masks = self._neighbour_remove_masks(sam3_rows)
+
+        # Pass 0b: chunk-start one-to-one Hungarian over bbox IoU, with a face
+        # cosine blend so a face-consistent snapshot beats a higher-IoU
+        # stranger (the boundary identity swap). Greedy best-per-row also let
+        # an interloping bbox steal a gid; the Hungarian fixes that.
+        inherit_by_obj_id: dict[int, _ChunkBoundarySnapshot] = (
+            self._compute_chunk_start_inherits(
+                sam3_rows, frame_rgb, face_remove_masks
+            )
+            if self._frames_into_chunk == 0 and self._carryover
+            else {}
+        )
 
         # Pass 1: refresh bindings + accumulate face evidence. Streak update
         # is deferred — it needs the column-winner view across all bindings.
@@ -265,17 +375,21 @@ class IdentityResolver:
                     sam3_obj_id=sam3_obj_id, chunk_id=self._chunk_id
                 )
                 self._tracks[sam3_obj_id] = binding
-                if self._frames_into_chunk == 0 and self._partial_carryover:
-                    self._maybe_inherit_partial_evidence(
-                        binding, tuple(row["bbox"])
-                    )
+                carry = inherit_by_obj_id.get(sam3_obj_id)
+                if carry is not None:
+                    self._apply_carryover_snapshot(binding, carry)
             else:
                 binding = existing
             binding.last_bbox = tuple(row["bbox"])
+            binding.last_mask = row.get("mask")
             binding.last_seen_frame_idx = frame_idx
-            new_face = self._maybe_accumulate_face(frame_rgb, row, binding)
+            new_face = self._maybe_accumulate_face(
+                frame_rgb, row, binding,
+                remove_mask=face_remove_masks.get(sam3_obj_id),
+            )
             if new_face is not None:
                 sampled_this_frame.append((binding, new_face))
+                binding.last_face_frame_idx = frame_idx
             new_osnet = self._maybe_accumulate_osnet(frame_rgb, row, binding)
             if new_osnet is not None:
                 sampled_osnet_this_frame.append((binding, new_osnet))
@@ -289,6 +403,21 @@ class IdentityResolver:
 
         # Run confirmation Hungarian on bindings that hit M observations.
         self._maybe_confirm()
+
+        # Operator stickiness is identity-level: any binding re-bound to an
+        # operator-assigned gid (warm rebind, inherit, or fresh confirm)
+        # re-acquires the flag, so a labelled person isn't demotable after a
+        # chunk-boundary handoff drops the original binding.
+        if self._operator_gids:
+            for b in bindings_this_frame:
+                if b.confirmed and b.global_id in self._operator_gids:
+                    b.operator_assigned = True
+
+        # Per-pass uniqueness: one physical person -> one gid. Two confirmed
+        # tracks sharing a gid are a genuine duplicate ONLY when their
+        # silhouettes are disjoint (two people); an overlapping co-hold is the
+        # same person mid chunk-handoff and is left alone.
+        self._enforce_gid_uniqueness(bindings_this_frame)
 
         if self._warm_writer is not None:
             frame_height = int(frame_rgb.shape[0])
@@ -308,12 +437,33 @@ class IdentityResolver:
         if self._frames_into_chunk >= 1:
             # Carryover only fires on chunk-frame 0; drop it so mid-chunk
             # tracks at the same position can't claim a snapshot.
-            self._partial_carryover = []
+            self._carryover = []
+
+        # Record each gid's current location for the locality gate (used on the
+        # next frame's rebinds — so it reflects positions BEFORE this frame).
+        for b in self._tracks.values():
+            if b.global_id >= 0 and b.last_bbox is not None:
+                bx = b.last_bbox
+                self._gid_last_seen[b.global_id] = (
+                    frame_idx, ((bx[0] + bx[2]) / 2.0, (bx[1] + bx[3]) / 2.0),
+                )
 
         # Enrich AFTER confirmation so this frame reflects new gid assignments.
         sampled_obj_ids = {b.sam3_obj_id for b, _emb in sampled_this_frame}
         self._record_det_rows(sam3_rows, bindings_this_frame, sampled_obj_ids, frame_idx)
-        return [self._enrich(row, b) for row, b in zip(sam3_rows, bindings_this_frame)]
+        # Face counts as "recently visible" if sampled within 3 cadence periods —
+        # tolerates a missed sample without falsely suppressing a frontal face.
+        face_window = 3 * self._K
+        return [
+            self._enrich(
+                row, b,
+                face_visible_recently=(
+                    b.last_face_frame_idx >= 0
+                    and frame_idx - b.last_face_frame_idx <= face_window
+                ),
+            )
+            for row, b in zip(sam3_rows, bindings_this_frame)
+        ]
 
     def apply_operator_overrides(
         self,
@@ -332,6 +482,7 @@ class IdentityResolver:
             b.global_id = int(gid)
             b.confirmed = True
             b.operator_assigned = True
+            self._operator_gids.add(int(gid))
         return [
             self._enrich(row, self._tracks[int(row["sam3_obj_id"])])
             for row in sam3_rows
@@ -394,23 +545,112 @@ class IdentityResolver:
             self._gid_prev_by_track[new_tid] = (
                 self._gid_prev_by_track.pop(old_tid)
             )
+        # WarmGalleryWriter is keyed by track_id and would otherwise drop the
+        # face-confirm history on rekey, blocking OSNet writes for the rest
+        # of the chunk (the trust-window gate sees `last_face is None`).
+        if self._warm_writer is not None:
+            self._warm_writer.rekey_track(old_tid, new_tid)
 
-    def _maybe_inherit_partial_evidence(
+    def _compute_chunk_start_inherits(
+        self, sam3_rows: list[dict], frame_rgb: np.ndarray,
+        remove_masks: dict[int, Optional[np.ndarray]],
+    ) -> dict[int, _ChunkBoundarySnapshot]:
+        # One-to-one Hungarian between new sam3_obj_ids and end-of-prev-chunk
+        # snapshots. bbox IoU below partial_carry_iou_floor is the cheap
+        # feasibility pre-filter; among bbox-feasible pairs, mask IoU vetoes a
+        # body whose silhouette is disjoint from the snapshot (two overlapping
+        # bboxes, separate people — the duplicate-gid swap) and a face cosine
+        # blend reorders the rest. Matched snapshots are popped from _carryover.
+        frame_hw = frame_rgb.shape[:2]
+        new_rows = [
+            (int(r["sam3_obj_id"]), tuple(float(v) for v in r["bbox"]), r.get("mask"))
+            for r in sam3_rows
+            if int(r["sam3_obj_id"]) not in self._tracks
+        ]
+        if not new_rows or not self._carryover:
+            return {}
+        n_rows = len(new_rows)
+        n_carry = len(self._carryover)
+        # The new track has no accumulated embedding yet (this runs before Pass
+        # 1), so sample its face/OSNet on demand — lazily, at most once per row,
+        # only when a feasible snapshot is present to disambiguate.
+        appearance_cache: dict[int, tuple[Optional[np.ndarray], Optional[np.ndarray]]] = {}
+
+        def _new_appearance(i):
+            if i not in appearance_cache:
+                oid, bbox, _m = new_rows[i]
+                appearance_cache[i] = self._sample_appearance(
+                    frame_rgb, bbox, remove_masks.get(oid),
+                )
+            return appearance_cache[i]
+
+        cost = np.full((n_rows, n_carry), _INHERIT_INFEASIBLE, dtype=np.float64)
+        for i, (_oid, bbox, mask) in enumerate(new_rows):
+            for j, carry in enumerate(self._carryover):
+                iou = iou_xyxy(bbox, carry.last_bbox)
+                # Mask refinement only when both silhouettes are full-frame
+                # (real SAM3 masks). A disjoint mask vetoes a bbox-overlapping
+                # stranger; a high mask IoU rescues a partial re-detection whose
+                # bbox fell below the floor (the same person, smaller crop).
+                miou = None
+                if (mask is not None and carry.last_mask is not None
+                        and mask.shape == frame_hw
+                        and carry.last_mask.shape == frame_hw):
+                    miou = _mask_iou(mask, carry.last_mask)
+                bbox_ok = iou >= self._partial_carry_iou_floor
+                # Only a face-confirmed snapshot may rescue a sub-bbox-floor
+                # inherit on mask alone — a faceless (OSNet/operator-only) gid is
+                # leak-prone and the inherit has no appearance veto, so mask
+                # continuity would otherwise spread a wrong gid across chunks.
+                mask_continues = (
+                    miou is not None and miou >= _INHERIT_MASK_CONTINUITY_FLOOR
+                    and carry.n_face_observations > 0
+                )
+                if not (bbox_ok or mask_continues):
+                    continue
+                if miou is not None and miou < _INHERIT_MASK_FLOOR:
+                    continue
+                geo = miou if miou is not None else iou
+                new_face, new_osnet = _new_appearance(i)
+                bonus = _inherit_appearance_bonus(carry, new_face, new_osnet)
+                cost[i, j] = (1.0 - geo) - bonus
+        row_idx, col_idx = linear_sum_assignment(cost)
+        result: dict[int, _ChunkBoundarySnapshot] = {}
+        matched_carry_indices: list[int] = []
+        for r, c in zip(row_idx, col_idx):
+            if cost[r, c] >= _INHERIT_INFEASIBLE:
+                continue
+            obj_id = new_rows[r][0]
+            result[obj_id] = self._carryover[c]
+            matched_carry_indices.append(int(c))
+        # Pop in reverse-index order so list indices stay valid.
+        for c in sorted(matched_carry_indices, reverse=True):
+            self._carryover.pop(c)
+        return result
+
+    def _sample_appearance(
+        self, frame_rgb: np.ndarray, bbox: tuple, remove_mask: Optional[np.ndarray],
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Face (preferred) + OSNet embedding for a NEW box at inherit time —
+        no binding accumulation, used only to disambiguate the inherit match."""
+        face = None
+        crop = _crop(frame_rgb, bbox, remove_mask=remove_mask)
+        if crop.size > 0:
+            result = self._face.extract_with_quality(crop, tuple(bbox))
+            if result is not None and result[1] > 0:
+                face = result[0]
+        osnet = None
+        if self._osnet is not None:
+            embs = self._osnet.extract(frame_rgb, [bbox])
+            if embs.shape[0] > 0 and np.any(embs[0]):
+                osnet = embs[0]
+        return face, osnet
+
+    def _apply_carryover_snapshot(
         self,
         binding: TrackBinding,
-        bbox: tuple,
+        carry: _ChunkBoundarySnapshot,
     ) -> None:
-        # Match new binding to a prev-chunk snapshot by bbox IoU; one-to-one transfer.
-        best_iou = 0.0
-        best_idx = -1
-        for i, carry in enumerate(self._partial_carryover):
-            iou = iou_xyxy(bbox, carry.last_bbox)
-            if iou > best_iou:
-                best_iou = iou
-                best_idx = i
-        if best_idx < 0 or best_iou < self._partial_carry_iou_floor:
-            return
-        carry = self._partial_carryover.pop(best_idx)
         binding.face_emb_sum = carry.face_emb_sum
         binding.face_weight_total = carry.face_weight_total
         binding.n_face_observations = carry.n_face_observations
@@ -442,14 +682,41 @@ class IdentityResolver:
         cos = float(np.dot(new_emb, running))
         return cos < self._face_consistency_cos_floor
 
+    def _neighbour_remove_masks(
+        self, sam3_rows: list[dict]
+    ) -> dict[int, Optional[np.ndarray]]:
+        # Per obj_id: the pixels owned by any OTHER detection that intrudes this
+        # bbox, minus this detection's own silhouette. Subtracting only these
+        # from the face crop keeps a neighbour's face out without clipping the
+        # person's own face (no-op for isolated detections → raw bbox).
+        rows = [r for r in sam3_rows if r.get("mask") is not None]
+        out: dict[int, Optional[np.ndarray]] = {}
+        for r in rows:
+            oid = int(r["sam3_obj_id"])
+            own = np.asarray(r["mask"]).astype(bool)
+            x1, y1, x2, y2 = (int(round(float(v))) for v in r["bbox"])
+            union = None
+            for other in rows:
+                if other is r:
+                    continue
+                om = np.asarray(other["mask"]).astype(bool)
+                if om.shape != own.shape:
+                    continue  # masks must share the frame grid to be subtracted
+                if not om[max(0, y1):max(0, y2), max(0, x1):max(0, x2)].any():
+                    continue  # neighbour does not intrude this bbox
+                union = om.copy() if union is None else (union | om)
+            out[oid] = (union & ~own) if union is not None else None
+        return out
+
     def _maybe_accumulate_face(
-        self, frame_rgb: np.ndarray, row: dict, binding: TrackBinding
+        self, frame_rgb: np.ndarray, row: dict, binding: TrackBinding,
+        remove_mask: Optional[np.ndarray] = None,
     ) -> Optional[np.ndarray]:
         """Return the new face embedding sampled this call (or None)."""
         if binding.frames_seen % self._K != 0:
             return None
         bbox = row["bbox"]
-        body_crop = _crop(frame_rgb, bbox)
+        body_crop = _crop(frame_rgb, bbox, remove_mask=remove_mask)
         if body_crop.size == 0:
             return None
         result = self._face.extract_with_quality(body_crop, tuple(bbox))
@@ -478,7 +745,7 @@ class IdentityResolver:
         binding.face_weight_total += quality
         binding.n_face_observations += 1
         # Surface the per-detection InsightFace confidence so HungarianAssigner
-        # can drop the face term for low-quality detections (ADR-0018).
+        # can drop the face term for low-quality detections.
         binding.last_face_det_score = float(det_score)
         return emb
 
@@ -551,12 +818,69 @@ class IdentityResolver:
             cos_assigned = cosines.get(b.global_id, 0.0)
             if b.global_id == row_max_gid or b.global_id == available_row_max_gid:
                 b.low_confidence_streak = 0
-            elif cos_assigned < self._low_conf_cos:
+            elif cos_assigned < self._low_conf_cos and not self._running_mean_supports(
+                b, identities
+            ):
+                # Only a per-frame dip that the accumulated identity ALSO
+                # contradicts counts as a strike. The running mean is the
+                # trusted identity; demoting on per-frame noise re-unknowns
+                # distant/profile faces whose accumulated match is still solid.
                 b.low_confidence_streak += 1
                 if b.low_confidence_streak >= self._streak_max:
                     self._demote(b)
             else:
                 b.low_confidence_streak = 0
+
+    def _running_mean_supports(
+        self, b: TrackBinding, identities: list
+    ) -> bool:
+        # The accumulated (running-mean) face still backs the assigned gid:
+        # either it is the argmax identity, or it clears the low-confidence
+        # floor. Absent a running mean, there is nothing to defend the bind.
+        running = b.face_emb_running
+        if running is None:
+            return False
+        cos = {
+            ident.global_id: float(np.dot(running, ident.face_centroid))
+            for ident in identities
+        }
+        argmax_gid = max(cos, key=cos.get)
+        return b.global_id == argmax_gid or cos.get(b.global_id, 0.0) >= self._low_conf_cos
+
+    def _enforce_gid_uniqueness(self, bindings: list[TrackBinding]) -> None:
+        by_gid: dict[int, list[TrackBinding]] = {}
+        for b in bindings:
+            if b.confirmed and b.global_id >= 0:
+                by_gid.setdefault(b.global_id, []).append(b)
+        for group in by_gid.values():
+            if len(group) < 2:
+                continue
+            anchor = max(group, key=self._uniqueness_strength)
+            for b in group:
+                if b is anchor or not self._spatially_disjoint(b, anchor):
+                    continue
+                # Wrong body holding the gid (a copied-evidence duplicate may
+                # even carry operator_assigned) — clear it so the demotion sticks.
+                b.operator_assigned = False
+                self._demote(b)
+
+    @staticmethod
+    def _uniqueness_strength(b: TrackBinding) -> tuple:
+        # Operator label first, then accumulated evidence, then tenure.
+        return (b.operator_assigned, b.face_weight_total,
+                b.osnet_weight_total, b.frames_seen)
+
+    def _spatially_disjoint(self, a: TrackBinding, b: TrackBinding) -> bool:
+        # Disjoint silhouettes = two people (a genuine duplicate). Overlapping =
+        # one person mid-handoff (exempt). Mask IoU when both masks are present
+        # and same-shape; else only a zero-bbox-overlap counts as disjoint, so a
+        # mask-less handoff is never wrongly demoted.
+        if (a.last_mask is not None and b.last_mask is not None
+                and a.last_mask.shape == b.last_mask.shape):
+            return _mask_iou(a.last_mask, b.last_mask) < _INHERIT_MASK_FLOOR
+        if a.last_bbox is None or b.last_bbox is None:
+            return False
+        return iou_xyxy(tuple(a.last_bbox), tuple(b.last_bbox)) <= 0.0
 
     def _demote(self, b: TrackBinding) -> None:
         # Reset evidence + block re-binding to the same gid (sparse-KPL would repeat the error).
@@ -612,6 +936,7 @@ class IdentityResolver:
                 b.osnet_column_loss_streak = 0
 
     def _maybe_confirm(self) -> None:
+        self._confirm_abstain = {}
         candidates_with_evidence = [
             b for b in self._tracks.values()
             if not b.confirmed and (
@@ -624,11 +949,15 @@ class IdentityResolver:
         confirmed_gids = {
             b.global_id for b in self._tracks.values() if b.confirmed
         }
+        trace = self._trace_log is not None
         free_identities = [
             ident for ident in self._gallery
             if ident.global_id not in confirmed_gids
         ]
         if not free_identities:
+            if trace:
+                for b in candidates_with_evidence:
+                    self._note_confirm_abstain(b, "gid_taken", confirmed_gids)
             return
 
         detections = [
@@ -640,6 +969,9 @@ class IdentityResolver:
                            else np.zeros(512, dtype=np.float32)),
                 long_gap=b.long_gap,
                 face_det_score=b.last_face_det_score,
+                # Blocked pairs are masked in the cost matrix so Hungarian
+                # can spend the assignment on the next-best free Identity.
+                blocked_gids=set(b.blocked_gids),
             )
             for b in candidates_with_evidence
         ]
@@ -650,14 +982,105 @@ class IdentityResolver:
         # Filter through ConfidenceGate; OSNet-only matches must clear floor + margin.
         for (det_idx, gid), info in zip(matched, infos):
             b = candidates_with_evidence[det_idx]
-            if gid in b.blocked_gids:
-                # Previously demoted from this gid in this chunk — skip.
-                continue
+            reason: str | None = None
             if not evaluate_gate(info, self._thresholds).confirmed:
+                reason = "gate"
+            # KPL-agreement: warm augmentation may rank a match, but the trusted
+            # KPL centroid must independently clear the floor before a fresh
+            # identity is committed. A contaminated crop can match a neighbour's
+            # in-video warm faces, and the gate's max(KPL, warm) would otherwise
+            # let warm single-handedly lock the wrong gid.
+            elif info.cost_path == "face" and (
+                info.kpl_sim is None
+                or info.kpl_sim < self._thresholds.face_sim_floor
+            ):
+                reason = "kpl_disagree"
+            # Per-box appearance gate: a body-only (OSNet) free-gid confirm must
+            # WIN the KPL appearance by a clear margin. Warm-only scoring zeroes an
+            # unseen identity, so a same-build body would otherwise be stolen by a
+            # seen identity's warm pool; the live KPL centroids veto both a
+            # different-identity argmax (f273 Klaus/Werner, Florian) AND a near-tie
+            # second the body can't be told apart from (f1358 Luca/Florian) — both
+            # are coin-flips, so abstain rather than guess.
+            elif info.cost_path == "osnet" and self._osnet_match_ambiguous(b, gid):
+                reason = "osnet_ambiguous"
+            elif not self._locality_ok(b, gid, cost_path=info.cost_path):
+                reason = "locality"
+            if reason is not None:
+                if trace:
+                    self._note_confirm_abstain(b, reason, confirmed_gids)
                 continue
             b.global_id = gid
             b.confirmed = True
             self._emit_rebind_event(b, info)
+
+        if trace:
+            for b in candidates_with_evidence:
+                if b.confirmed or b.sam3_obj_id in self._confirm_abstain:
+                    continue
+                self._note_confirm_abstain(b, "no_free_match", confirmed_gids)
+
+    def _note_confirm_abstain(
+        self, b: TrackBinding, proximate: str, confirmed_gids: set[int]
+    ) -> None:
+        # Root cause beats proximate: when a track's best identity over the FULL
+        # gallery is already held, the gid being unavailable is the real reason a
+        # well-matched track can't bind — surface that over the fallback-gid miss.
+        emb = b.face_emb_running
+        attr = "face_centroid"
+        if emb is None:
+            emb = b.osnet_emb_running
+            attr = "appearance_centroid"
+        if emb is not None and len(self._gallery) > 0:
+            cos = {
+                ident.global_id: float(np.dot(emb, getattr(ident, attr)))
+                for ident in self._gallery
+            }
+            if max(cos, key=cos.get) in confirmed_gids:
+                self._confirm_abstain[b.sam3_obj_id] = "gid_taken"
+                return
+        self._confirm_abstain[b.sam3_obj_id] = proximate
+
+    def _locality_ok(self, b: TrackBinding, gid: int, *, cost_path: str | None = None) -> bool:
+        # Reject a (re)bind when the gid was seen <= max_stale_frames ago but the
+        # target box is > max_jump_px from that last-seen centre — a gid can't
+        # teleport across the frame in a few frames. Gids unseen for longer are
+        # genuine re-entries and are not gated — EXCEPT a body-only (OSNet) rebind
+        # whose implied speed is physically impossible: a same-build body just
+        # past the stale window steals the gid (the seat->across-room teleport
+        # that orphans a window). Face rebinds are trusted (identity matched), so
+        # only the body path carries the speed cap.
+        seen = self._gid_last_seen.get(gid)
+        if seen is None or b.last_bbox is None:
+            return True
+        last_frame, (lx, ly) = seen
+        bx = b.last_bbox
+        cx, cy = (bx[0] + bx[2]) / 2.0, (bx[1] + bx[3]) / 2.0
+        dist = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
+        gap = self._current_frame_idx - last_frame
+        if gap > self._locality_max_stale_frames:
+            if (
+                cost_path == "osnet"
+                and dist > self._locality_max_jump_px
+                and dist / max(1, gap) > self._locality_max_speed_px
+            ):
+                return False
+            return True
+        return dist <= self._locality_max_jump_px
+
+    def _osnet_match_ambiguous(self, b: TrackBinding, gid: int) -> bool:
+        emb = b.osnet_emb_running
+        if emb is None or len(self._gallery) == 0:
+            return False
+        cos = {
+            ident.global_id: float(np.dot(emb, ident.appearance_centroid))
+            for ident in self._gallery
+        }
+        my_cos = cos.get(gid, -float("inf"))
+        best_other = max(
+            (c for g, c in cos.items() if g != gid), default=-float("inf"),
+        )
+        return my_cos - best_other < _OSNET_TIE_MARGIN
 
     def _maybe_write_warm_face(
         self,
@@ -731,6 +1154,8 @@ class IdentityResolver:
             winning_source=winning_source,
             winning_cosine=float(info.assigned_sim),
             runner_up_cosine=info.runner_up_cosine,
+            warm_pool_size=info.warm_pool_size,
+            warm_within_second=info.warm_within_second,
         )
 
     def _maybe_write_warm_osnet(
@@ -782,7 +1207,9 @@ class IdentityResolver:
             frame_height=frame_height,
         )
 
-    def _enrich(self, row: dict, binding: TrackBinding) -> dict:
+    def _enrich(
+        self, row: dict, binding: TrackBinding, face_visible_recently: bool = True
+    ) -> dict:
         out = dict(row)
         out["track_id"] = binding.track_id
         out["sam3_obj_id"] = binding.sam3_obj_id
@@ -796,6 +1223,11 @@ class IdentityResolver:
         out["mask_source"] = "detection"
         out["assignment_info"] = self._synthesise_assignment_info(binding)
         out["face_emb_present"] = binding.face_emb_running is not None
+        # Debounced per-frame face visibility for the skeleton face-gate: a face
+        # was sampled within the last few frames (orientation signal). NOT
+        # face_emb_present (stays True for any track that ever saw a face) and
+        # NOT raw this-frame sampling (K-cadence would dilute it to ~1/K).
+        out["face_visible_recently"] = face_visible_recently
         out["operator_assigned"] = binding.operator_assigned
         return out
 
@@ -936,6 +1368,7 @@ class IdentityResolver:
                 "osnet_cos_per_gid": osnet_cos,
                 "assignment": assignment,
                 "low_confidence_streak": int(b.low_confidence_streak),
+                "confirm_abstain": self._confirm_abstain.get(int(b.sam3_obj_id)),
             })
 
     def _record_chunk_boundary(self, frame_idx: int) -> None:
@@ -948,11 +1381,18 @@ class IdentityResolver:
         })
 
 
-def _crop(frame_rgb: np.ndarray, bbox) -> np.ndarray:
+def _crop(frame_rgb: np.ndarray, bbox, remove_mask: np.ndarray | None = None) -> np.ndarray:
     x1, y1, x2, y2 = (int(round(float(v))) for v in bbox)
     h, w = frame_rgb.shape[:2]
     x1 = max(0, min(x1, w)); x2 = max(0, min(x2, w))
     y1 = max(0, min(y1, h)); y2 = max(0, min(y2, h))
     if x2 <= x1 or y2 <= y1:
         return np.zeros((0, 0, 3), dtype=frame_rgb.dtype)
-    return frame_rgb[y1:y2, x1:x2]
+    crop = frame_rgb[y1:y2, x1:x2]
+    # Zero only pixels owned by an overlapping neighbour, never this person's
+    # own silhouette or the surrounding background — keeps a neighbour's face
+    # out of the crop while leaving the own (possibly outside-mask) face intact.
+    if remove_mask is not None and remove_mask.shape[:2] == (h, w):
+        crop = crop.copy()
+        crop[remove_mask[y1:y2, x1:x2].astype(bool)] = 0
+    return crop

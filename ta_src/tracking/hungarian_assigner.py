@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
@@ -17,9 +17,13 @@ class Detection:
     long_gap: bool = False
     # InsightFace's per-detection confidence in the face it produced for this
     # body crop. Rows with face_det_score < HungarianAssigner.face_quality_floor
-    # drop the face term and decide on OSNet + spatial only (ADR-0018). 0.0 is
+    # drop the face term and decide on OSNet + spatial only. 0.0 is
     # the safe default: with floor=0.0 (today's behaviour) the gate never fires.
     face_det_score: float = 0.0
+    # gids this binding was demoted from this chunk. Hungarian masks these
+    # pairs to infeasible cost so a blocked gid never wins the assignment
+    # only to be silently dropped by the resolver's post-filter.
+    blocked_gids: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -44,6 +48,15 @@ class AssignmentInfo:
     # uniform rebind events.
     runner_up_cosine: float | None = None
     warm_won: bool = False
+    # Warm-pool diagnostics for the body branch: how many face-vouched views
+    # backed the match, and the within-pool runner-up cosine (top1 >> this
+    # means a single stored view carried a max-pooled match).
+    warm_pool_size: int = 0
+    warm_within_second: float | None = None
+    # Face path only: the KPL-centroid cosine before warm augmentation. Lets a
+    # caller require the trusted studio anchor — not just max(KPL, warm) — to
+    # clear a floor, so warm can't single-handedly lock a fresh identity.
+    kpl_sim: float | None = None
 
 
 _INFEASIBLE_COST = 1e6
@@ -56,11 +69,18 @@ class HungarianAssigner:
         spatial_scale: float = 300.0,
         warm_match_floor: float = 0.5,
         face_quality_floor: float = 0.0,
+        osnet_confirm_warm_only: bool = False,
+        osnet_confirm_min_warm: int = 0,
     ):
         self.emb_weight = emb_weight
         self.spatial_scale = spatial_scale
         self.warm_match_floor = warm_match_floor
         self.face_quality_floor = float(face_quality_floor)
+        # Body re-id off the face-vouched warm pool only — the KPL-seed
+        # appearance centroid carries reference-photo clothing that mismatches
+        # in-video appearance and drives look-alike swaps.
+        self.osnet_confirm_warm_only = bool(osnet_confirm_warm_only)
+        self.osnet_confirm_min_warm = int(osnet_confirm_min_warm)
 
     def assign(
         self,
@@ -81,6 +101,9 @@ class HungarianAssigner:
         # Warm augmentation upgrades these to max(kpl, warm) when warm wins —
         # the gate must see the same per-pair similarity the assigner saw.
         face_cos = np.full((n_det, n_cand), np.nan, dtype=np.float64)
+        # KPL-only face cosine (pre-warm-augmentation), surfaced on the matched
+        # face-path row so the resolver's KPL-agreement guard can read it.
+        kpl_face_cos = np.full((n_det, n_cand), np.nan, dtype=np.float64)
         osnet_cos = np.zeros((n_det, n_cand), dtype=np.float64)
         warm_won_face = np.zeros((n_det, n_cand), dtype=bool)
         warm_won_osnet = np.zeros((n_det, n_cand), dtype=bool)
@@ -90,13 +113,15 @@ class HungarianAssigner:
                 and det.face_det_score >= self.face_quality_floor
             )
             for j, cand in enumerate(candidates):
+                if cand.global_id in det.blocked_gids:
+                    cost[i, j] = _INFEASIBLE_COST
+                    mask[i, j] = True
+                    continue
                 pair_cost, pair_masked = self._pair_cost(det, cand, warm, face_usable)
                 cost[i, j] = pair_cost
                 mask[i, j] = pair_masked
-                kpl_osnet = float(np.dot(det.osnet_emb, cand.appearance_centroid))
-                aug_osnet, osnet_warm = _augment_and_source(
-                    kpl_osnet, warm, cand.global_id, "osnet", det.osnet_emb,
-                )
+                aug_osnet, _osnet_feasible, osnet_warm = self._osnet_sim(
+                    det, cand, warm)
                 osnet_cos[i, j] = aug_osnet
                 warm_won_osnet[i, j] = osnet_warm
                 if face_usable:
@@ -105,6 +130,7 @@ class HungarianAssigner:
                         kpl_face, warm, cand.global_id, "face", det.face_emb,
                     )
                     face_cos[i, j] = aug_face
+                    kpl_face_cos[i, j] = kpl_face
                     warm_won_face[i, j] = face_warm
 
         row_idx, col_idx = linear_sum_assignment(cost)
@@ -133,6 +159,7 @@ class HungarianAssigner:
                     n_identities=n_cand,
                     runner_up_cosine=runner_up,
                     warm_won=bool(warm_won_face[r, c]),
+                    kpl_sim=float(kpl_face_cos[r, c]),
                 ))
             else:
                 # OSNet path: second_best_sim = max cosine over the other N-1 candidates.
@@ -142,6 +169,8 @@ class HungarianAssigner:
                     row = osnet_cos[r].copy()
                     row[c] = -np.inf
                     second_best = float(row.max())
+                pool_size, within_second = self._warm_osnet_diagnostics(
+                    detections[r], candidates[c].global_id, warm)
                 infos.append(AssignmentInfo(
                     cost_path="osnet",
                     assigned_sim=float(osnet_cos[r, c]),
@@ -149,6 +178,8 @@ class HungarianAssigner:
                     n_identities=n_cand,
                     runner_up_cosine=second_best,
                     warm_won=bool(warm_won_osnet[r, c]),
+                    warm_pool_size=pool_size,
+                    warm_within_second=within_second,
                 ))
 
         excess = [i for i in range(n_det) if i not in assigned_rows]
@@ -164,7 +195,7 @@ class HungarianAssigner:
 
         face_usable=False forces this pair onto the OSNet+spatial branch
         regardless of whether det.face_emb is populated — the face-quality
-        gate (ADR-0018) drops the face term proactively for low-confidence
+        gate drops the face term proactively for low-confidence
         InsightFace detections (profile views, motion blur)."""
         if face_usable and det.face_emb is not None:
             kpl_cos = float(np.dot(det.face_emb, cand.face_centroid))
@@ -178,16 +209,10 @@ class HungarianAssigner:
                     return 1.0 - warm_cos, False
             return 1.0 - kpl_cos, False
 
-        kpl_osnet_cos = float(np.dot(det.osnet_emb, cand.appearance_centroid))
-        if warm is not None:
-            warm_osnet_cos = warm.best_similarity(
-                cand.global_id, "osnet", det.osnet_emb,
-            )
-            if warm_osnet_cos is not None and warm_osnet_cos > kpl_osnet_cos:
-                if warm_osnet_cos < self.warm_match_floor:
-                    return _INFEASIBLE_COST, True
-                kpl_osnet_cos = warm_osnet_cos
-        osnet_cost = 1.0 - kpl_osnet_cos
+        osnet_sim, feasible, _warm_won = self._osnet_sim(det, cand, warm)
+        if not feasible:
+            return _INFEASIBLE_COST, True
+        osnet_cost = 1.0 - osnet_sim
         if cand.kalman is None or det.long_gap:
             return osnet_cost, False
 
@@ -196,6 +221,47 @@ class HungarianAssigner:
             self.emb_weight * osnet_cost + (1.0 - self.emb_weight) * spatial_cost,
             False,
         )
+
+    def _osnet_sim(
+        self, det: Detection, cand: Candidate, warm,
+    ) -> tuple[float, bool, bool]:
+        """Returns (cosine, feasible, warm_won) for the body branch.
+
+        In warm-only mode the KPL-seed appearance centroid is ignored entirely:
+        the body match scores against the warm pool, feasible only once it holds
+        >= osnet_confirm_min_warm face-vouched views. Otherwise the legacy
+        max(kpl, warm) blend stands; a warm win below warm_match_floor masks."""
+        if self.osnet_confirm_warm_only:
+            if warm is None or warm.size(
+                    cand.global_id, "osnet") < self.osnet_confirm_min_warm:
+                return 0.0, False, False
+            warm_cos = warm.best_similarity(cand.global_id, "osnet", det.osnet_emb)
+            if warm_cos is None:
+                return 0.0, False, False
+            return float(warm_cos), warm_cos >= self.warm_match_floor, True
+        kpl = float(np.dot(det.osnet_emb, cand.appearance_centroid))
+        if warm is not None:
+            warm_cos = warm.best_similarity(cand.global_id, "osnet", det.osnet_emb)
+            if warm_cos is not None and warm_cos > kpl:
+                return float(warm_cos), warm_cos >= self.warm_match_floor, True
+        return kpl, True, False
+
+    @staticmethod
+    def _warm_osnet_diagnostics(
+        det: Detection, gid: int, warm,
+    ) -> tuple[int, float | None]:
+        """(pool_size, within_pool_runner_up) for the body warm pool; zeros when
+        warm is absent or doesn't expose the accessors (minimal test fakes)."""
+        if warm is None:
+            return 0, None
+        size_fn = getattr(warm, "size", None)
+        pool_size = int(size_fn(gid, "osnet")) if size_fn is not None else 0
+        top_fn = getattr(warm, "top_similarities", None)
+        within_second = None
+        if top_fn is not None:
+            top = top_fn(gid, "osnet", det.osnet_emb, 2)
+            within_second = float(top[1]) if len(top) >= 2 else None
+        return pool_size, within_second
 
     def _spatial_cost(self, det_box, kalman) -> float:
         """1 − spatial_similarity, where similarity = max(0, 1 − dist/scale)."""
@@ -206,12 +272,6 @@ class HungarianAssigner:
         dist = float(np.hypot(det_cx - cand_cx, det_cy - cand_cy))
         spatial_sim = max(0.0, 1.0 - dist / self.spatial_scale)
         return 1.0 - spatial_sim
-
-
-def _augment_with_warm(
-    kpl_sim: float, warm, gid: int, kind: str, query_emb: np.ndarray,
-) -> float:
-    return _augment_and_source(kpl_sim, warm, gid, kind, query_emb)[0]
 
 
 def _augment_and_source(

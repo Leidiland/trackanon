@@ -64,30 +64,6 @@ class CropCaptioner:
             logits = self._model(**inputs).logits_per_image[0]
         return int(logits.argmax())
 
-    def similarity(self, crop_rgb: np.ndarray, text: str) -> float:
-        """Cosine similarity in [0, 1] between the crop and ``text`` via CLIP.
-
-        Used as a prompt-fidelity multiplier when scoring prewarm candidates:
-        an off-prompt candidate (low cosine) is multiplicatively punished
-        regardless of diversity, fixing the gender/identity drift that
-        face-embedding-only scoring caused at prewarm_generator.py.
-        """
-        import torch
-        from PIL import Image
-
-        img = Image.fromarray(crop_rgb)
-        inputs = self._proc(
-            text=[text], images=img, return_tensors="pt",
-            padding=True, truncation=True,
-        )
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = self._model(**inputs)
-            img_emb = out.image_embeds / out.image_embeds.norm(dim=-1, keepdim=True)
-            txt_emb = out.text_embeds / out.text_embeds.norm(dim=-1, keepdim=True)
-            sim = float((img_emb * txt_emb).sum(dim=-1).item())
-        return max(0.0, sim)
-
     def describe(self, crop_rgb: np.ndarray, crop_mask: np.ndarray) -> str:
         """Return a descriptive prompt for the person visible in crop_rgb.
 

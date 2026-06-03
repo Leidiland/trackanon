@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+import cv2
 import numpy as np
 
 from ta_src.utils.quiet import suppressed_stdout
@@ -13,8 +14,8 @@ def _default_providers() -> list[str]:
     """Prefer CUDA when onnxruntime-gpu reports it as available.
 
     Falls back to CPU if CUDA isn't usable (no GPU, missing cuDNN/cuBLAS,
-    or onnxruntime-gpu not installed). Mirrors the pattern used by
-    vitpose_wrapper.py.
+    or onnxruntime-gpu not installed). Mirrors the DWpose wrapper's
+    provider selection.
     """
     try:
         import onnxruntime as ort
@@ -45,6 +46,11 @@ class FaceIDWrapper:
 
     Per-frame quality = det_score × sqrt(face_area / body_area), used to
     weight each frame's contribution to a track's running face mean.
+
+    Contract: callers pass RGB ndarrays. The wrapper converts RGB→BGR at
+    its single InsightFace seam (`_best_face`) — buffalo_l is BGR-trained
+    (OpenCV convention), so feeding RGB directly produces channel-swapped
+    embeddings that won't align with KPL centroids built the same way.
     """
 
     def __init__(
@@ -59,7 +65,7 @@ class FaceIDWrapper:
             self._app = _load_face_analysis(providers)
         except Exception as e:
             raise RuntimeError(
-                f"InsightFace buffalo_l failed to load; pipeline aborts at startup (ADR-0003): {e}"
+                f"InsightFace buffalo_l failed to load; pipeline aborts at startup: {e}"
             ) from e
 
     def extract(self, body_crop: np.ndarray) -> np.ndarray | None:
@@ -67,15 +73,6 @@ class FaceIDWrapper:
         if face is None:
             return None
         return np.asarray(face.normed_embedding, dtype=np.float32)
-
-    def extract_face_obj(self, body_crop: np.ndarray):
-        """Return the raw InsightFace face (det_score, pose, normed_embedding)
-        for the highest-confidence valid face in `body_crop`, or None.
-
-        Used by the prewarm best-of-N scorer (ADR-0008 addendum) which needs
-        det_score and pose alongside the embedding.
-        """
-        return self._best_face(body_crop)
 
     def detect_face_bbox(
         self, image: np.ndarray
@@ -97,7 +94,7 @@ class FaceIDWrapper:
         """Returns (embedding, quality, det_score) or None.
 
         det_score is the raw InsightFace per-detection confidence, surfaced
-        for the Hungarian face-quality gate (ADR-0018). quality is the area-
+        for the Hungarian face-quality gate. quality is the area-
         weighted accumulation weight used by the face_emb running mean."""
         face = self._best_face(body_crop)
         if face is None:
@@ -109,8 +106,26 @@ class FaceIDWrapper:
         quality = det_score * _area_ratio_sqrt(face.bbox, body_bbox)
         return emb, quality, det_score
 
+    def detect_faces(self, image: np.ndarray) -> list:
+        """Return every face passing the width + det-score floors, each with
+        .bbox (image coords) and .normed_embedding. Used by single-image
+        anonymization to match one face per person against the gallery."""
+        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        faces = self._app.get(image_bgr)
+        kept = []
+        for face in faces:
+            width = float(face.bbox[2]) - float(face.bbox[0])
+            if width < self.min_face_width_px:
+                continue
+            if float(face.det_score) < self.min_face_det_score:
+                continue
+            kept.append(face)
+        return kept
+
     def _best_face(self, body_crop: np.ndarray):
-        faces = self._app.get(body_crop)
+        # body_crop is RGB by convention; InsightFace expects BGR.
+        body_crop_bgr = cv2.cvtColor(body_crop, cv2.COLOR_RGB2BGR)
+        faces = self._app.get(body_crop_bgr)
         if not faces:
             return None
         face = max(faces, key=lambda f: float(f.bbox[2]) - float(f.bbox[0]))

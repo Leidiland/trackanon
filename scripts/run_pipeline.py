@@ -51,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Run the trackanon pipeline. "
             "Unknown arguments are forwarded verbatim as Hydra overrides "
-            "(e.g. pose=vitpose, temporal.window=8)."
+            "(e.g. pose=dwpose, temporal.window=8)."
         ),
     )
 
@@ -125,6 +125,15 @@ def main() -> None:
     overrides = (getattr(args, OVERRIDES_DEST) or []) + passthrough
     with initialize_config_dir(config_dir=str(CONFIG_DIR), version_base=None):
         cfg = compose(config_name="config", overrides=overrides)
+    # Make the run.log self-describing: the literal command + the resolved knobs
+    # that are otherwise unrecoverable from the log (window, fps, backend).
+    log.info("run command: %s", " ".join(sys.argv))
+    log.info(
+        "resolved run: input=%s output=%s window=[%s, %s] fps=%s generator=%s",
+        cfg.paths.get("input"), cfg.paths.get("output"),
+        cfg.temporal.get("start_time"), cfg.temporal.get("end_time"),
+        cfg.temporal.get("fps"), cfg.anonymization.get("generator", "vace"),
+    )
     Pipeline(cfg).run()
 
 

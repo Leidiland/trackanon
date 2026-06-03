@@ -120,6 +120,8 @@ class ConfidenceLog:
         ],
         winning_cosine: float,
         runner_up_cosine: float | None,
+        warm_pool_size: int = 0,
+        warm_within_second: float | None = None,
     ) -> None:
         if self._fp is None:
             return
@@ -132,6 +134,10 @@ class ConfidenceLog:
             "winning_cosine": float(winning_cosine),
             "runner_up_cosine": (
                 float(runner_up_cosine) if runner_up_cosine is not None else None
+            ),
+            "warm_pool_size": int(warm_pool_size),
+            "warm_within_second": (
+                float(warm_within_second) if warm_within_second is not None else None
             ),
         }
         self._fp.write(json.dumps(row) + "\n")

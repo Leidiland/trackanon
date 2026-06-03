@@ -59,6 +59,24 @@ class WarmGalleryWriter:
     def last_face_confirm_frame(self, track_id: int) -> int | None:
         return self._last_face_confirm_by_track.get(track_id)
 
+    def reset_video(self) -> None:
+        """Drop per-track confirm history at a video boundary. track_ids recycle
+        across videos, so a stale entry would mis-gate the next video's writes.
+        Anchor counts and the gallery pools persist — they track known persons,
+        not tracks."""
+        self._last_face_confirm_by_track.clear()
+
+    def rekey_track(self, old_track_id: int, new_track_id: int) -> None:
+        """Migrate per-track state when IdentityResolver rekeys a binding
+        across a SAM3 obj_id churn. Without this, the new track_id sees an
+        empty face-confirm history and the OSNet trust window blocks every
+        subsequent write for the rest of the chunk."""
+        if old_track_id == new_track_id:
+            return
+        confirm = self._last_face_confirm_by_track.pop(old_track_id, None)
+        if confirm is not None:
+            self._last_face_confirm_by_track[new_track_id] = confirm
+
     def maybe_write_face(
         self,
         binding,

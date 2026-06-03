@@ -6,6 +6,20 @@ run_anonymization: true
 visualize: false
 save_visualization: false
 
+# Per-chunk gc.collect + glibc malloc_trim so the pipeline's own RSS doesn't
+# ratchet up across chunks/videos (freed buffers glibc keeps in-arena). The
+# process can't restart itself the way the ComfyUI server can.
+trim_host_memory_per_chunk: true
+
+# Per-frame Pass-1 cache (mask RLE + enriched track rows). Empty = ephemeral
+# default at data/temp/track_cache/<stem>_<uuid>/ wiped on exit. Set to a path
+# OUTSIDE data/temp (e.g. outputs/eval/cache/<scene>) to preserve the cache
+# past run end for downstream eval scripts. The wipe is path-conditional —
+# only paths under paths.temp get cleaned up. For tracking-only runs (no
+# anonymisation) this is the opt-in that turns on cache writing; the windowed
+# VACE backend always writes it (Pass 1) and reads it back for Pass 2.
+track_cache_dir: ""
+
 # Debug instrumentation. When non-empty, the pipeline:
 #  - Enables IdentityResolver per-detection trace (gid, cosines, streak,
 #    assignment cost path) and dumps `<input.stem>.tracking.jsonl` +
@@ -14,8 +28,12 @@ save_visualization: false
 #    main DEBUG log (route taken, mask area ratio, mask score, confirmation
 #    state). Toggle requires --debug to surface.
 trace_dir: ""
+# Tracking-only runs write the resolver's per-video rebind ConfidenceLog
+# ({stem}.jsonl) here so warm-gallery diagnostics survive without an
+# anonymization run. Empty falls back to trace_dir.
+confidence_log_dir: ""
 
-# Frame-0 manual gid bootstrap (ADR-0015). When enabled, the pipeline pauses
+# Frame-0 manual gid bootstrap. When enabled, the pipeline pauses
 # after IdentityResolver.update on frame 0 and lets the operator confirm or
 # correct the proposed sam3_obj_id → global_id mapping via a sidecar JSON.
 # Operator-assigned bindings carry an operator_assigned flag that bypasses
@@ -24,10 +42,21 @@ trace_dir: ""
 op_edit:
   enabled: false
   frame_0: true
+  # Also pause mid-clip the first time a genuinely new unidentified person
+  # settles in frame. Dedup is by location so a chunk-renumbered same person is
+  # not re-asked; a labelled person later genuinely lost re-fires. Operator
+  # labels are identity-level sticky (re-bind to the same gid keeps protection)
+  # without loosening any geometric carry gate. Default off.
+  on_new_unknown: false
+  new_unknown:
+    sustained_frames: 10       # consecutive unknown frames before prompting
+    dedup_centroid_frac: 0.06  # same-person radius as a fraction of frame diagonal
+    dedup_recent_frames: 50    # a slot unseen this long is forgotten (re-fires later)
+    min_det_score: 0.5         # ignore low-confidence SAM 3 boxes
   artifact_dir: data/temp/op_edit
   # Diagnostic only. True = keep an existing operator-edited JSON instead of
-  # overwriting with a fresh proposal. ADR-0015 rejects this as a default
-  # (cross-run poisoning surface). Use for repro runs, then revert.
+  # overwriting with a fresh proposal. Not a default (cross-run poisoning
+  # surface). Use for repro runs, then revert.
   reuse_existing: false
   # web | stdin. web spins up a local FastAPI tab with clickable detection
   # boxes; stdin keeps the original JSON-in-editor flow (still the canary

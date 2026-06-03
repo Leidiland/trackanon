@@ -6,6 +6,11 @@ data/input_videos/
 data/output_videos/
 data/frames/
 data/temp/
+data/debug/
+data/eval_models/
+
+# Large binary assets — regenerable, kept local
+figures/
 
 # Outputs
 outputs/
@@ -47,3 +52,4 @@ temp_todo.txt
 # Claude Code per-developer / runtime state
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+.claude/projects/

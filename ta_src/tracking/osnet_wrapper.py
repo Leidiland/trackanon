@@ -70,14 +70,14 @@ class OSNetWrapper:
             # ImageNet weights cannot discriminate persons within the "person"
             # class — bodies in similar poses end up too close in embedding
             # space. ReID-trained checkpoints from the torchreid model zoo
-            # restore proper margins. Run scripts/download_osnet_weights.py to
+            # restore proper margins. Run scripts/download_weights.py to
             # fetch osnet_x1_0_msmt17.pt and point this config at it.
             if pretrained_reid_path is not None:
                 path = Path(pretrained_reid_path)
                 if not path.is_file():
                     raise RuntimeError(
                         f"OSNet ReID weights not found: {path} — run "
-                        f"scripts/download_osnet_weights.py or remove the "
+                        f"scripts/download_weights.py or remove the "
                         f"tracking.osnet_reid_weights config key."
                     )
                 _load_reid_weights(model, path)

@@ -1,0 +1,135 @@
+name: vace
+
+# IdentityResolver thresholds are read at the top level of `anonymization`
+# regardless of backend (main_pipeline._build_identity_resolver). Keep them
+# in sync with the per-backend gates under `vace:` so retuning lands once.
+confidence_face_threshold: 0.45
+confidence_osnet_abs_threshold: 0.50
+confidence_osnet_margin_threshold: 0.05
+
+# Backend selector — main_pipeline dispatches on this. Setting it here lets a
+# user pick the VACE backend with one Hydra override: `anonymization=vace`.
+generator: vace
+
+# === Wan-VACE backend (windowed reference-anchored generation) ==================
+# Runs its own ComfyUI on :8190 (the portable VACE server).
+# Pipeline shape:
+#   Pass 1: SAM3 + IdentityResolver -> track_cache (written once, read in Pass 2).
+#   Pass 2: per gid -> plan windows -> build bundle -> render -> stitch -> blur
+#           remaining cached silhouettes the fallback didn't paint.
+vace:
+  comfyui_host: "127.0.0.1"
+  comfyui_port: 8190
+  comfyui_input_dir: "external/comfyui-vace/input"
+  comfyui_output_dir: "external/comfyui-vace/output"
+
+  # Models (in the VACE ComfyUI's models/ dirs). Set gguf to a filename to use
+  # the 14B via UnetLoaderGGUF (unet is then ignored).
+  unet: "wan2.1_vace_1.3B_fp16.safetensors"
+  clip: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  vae: "wan_2.1_vae.safetensors"
+  gguf: null
+  # UNET load precision. "default" = fp16. "fp8_e4m3fn" quantises on load for
+  # ~1.4-1.7x on fp8 tensor cores (helps distill + native); small quality cost,
+  # A/B before defaulting on. Options: default | fp8_e4m3fn | fp8_e5m2 | fp8_e4m3fn_fast.
+  weight_dtype: "default"
+
+  # Window + crop. target_gids restricts to a subset; empty = auto-enumerate
+  # every confidence-passing gid from the track cache (anonymise everyone).
+  target_gids: []
+  # window_len must be 4n+1 (VAE temporal compression); the planner truncates
+  # silently if not. Local 1.3B = 49; rented-GPU 14B can stretch to 81 / 97
+  # (fewer boundaries, fewer cold-loads).
+  window_len: 49
+  overlap: 13             # adjacent windows blend linearly across this band
+  # Gap-split: presence is broken on any absence > max_bridge frames so VACE
+  # doesn't see a jump-cut as one continuous clip. Small gaps stay inside the
+  # window and the per-frame carry-over paints them from the last good mask.
+  max_bridge: 2
+  crop_pad: 0.10
+  crop_height: 832        # canvas height; width derived from the crop aspect, x16
+  grey_control: true
+  # Control recipe: "grey" greys the silhouette (VACE invents the pose); "pose"
+  # greys it AND draws the subject's skeleton in the hole so the persona adopts
+  # the original pose and fills the silhouette (fixes mask under-coverage on
+  # non-trivial poses). Falls back to grey per-frame when no body joints are seen.
+  control_mode: "grey"
+  pose_mask_dilate_px: 0  # dilate the silhouette gate for pose keypoints (px)
+  reference_dir: "data/gallery/reference_crops"
+
+  # Sampler. The per-gid reference_crops/{gid}.prompt.txt overrides `prompt`.
+  prompt: "a person sitting in a living room, photorealistic, natural indoor light, sharp detail"
+  negative: "blurry, low quality, distorted, deformed, extra limbs, extra people, mutated, watermark, text, cartoon, oversaturated"
+  seed: 42
+  steps: 20
+  cfg: 6.0
+  shift: 8.0
+  sampler: "uni_pc"
+  scheduler: "simple"
+  strength: 1.0
+  fps: 25
+  timeout: 2700.0
+  poll_interval: 4.0
+
+  # ----- Cross-window temporal continuity -----
+  # When true, the first `overlap` frames of every subsequent window per gid
+  # are preserved from the prior window's stitched output (mask=0 in the
+  # bundle, control video = prior pixels). VACE's temporal attention then
+  # smooths the regenerated rest of the window into the preserved anchor,
+  # eliminating the boundary identity shift linear-blend can't hide. Cost:
+  # windows of the same gid become sequential (preserve depends on prior
+  # window's stitch). Different gids stay parallel-eligible — the gid loop
+  # is the natural multi-GPU axis when there's a worker pool.
+  preserve_overlap: true
+
+  # ----- Composite -----
+  # 0 = hard mask paste; raise to Gaussian-feather the persona/scene boundary.
+  # SAM3 hugs the silhouette tight, especially at thin extremities (arms), and
+  # VACE doesn't repaint *exactly* on that line — feather smooths the step.
+  feather_px: 6
+  # Reference-anchored color correction. W1..N's painted regions are affine-
+  # pulled toward the anchor target, stopping cumulative VAE round-trip drift
+  # (gradual darkening/desat per cross-window step).
+  color_anchor: true
+  # Anchor target. "window0": pull the full L*a*b of later windows to W0 (drift
+  # correction). "reference" (default): chroma-only pull of each window toward
+  # the persona crop's a*/b* (L untouched, scale clamped so chroma can only
+  # drop) — desaturates the W2+ magenta that comes off the GPU without the
+  # whole-persona "glow"/lightening a full L*a*b match caused.
+  color_anchor_seed: reference
+  # Only with seed=reference: a window is desaturated only if its painted chroma
+  # exceeds the reference's OWN chroma by this margin (a*b* units). Adapts per
+  # persona, so a legitimately colourful persona is left alone. 0 = always.
+  color_anchor_chroma_guard: 4.0
+  # Privacy fallback. Any cached track silhouette VACE didn't paint at this
+  # frame gets the FallbackAnonymizer Gaussian blur. Painted_regions-aware so
+  # the carry-over leak path is closed: `cached_silhouette \ painted_region`
+  # is blurred even when the gate substituted a smaller carried mask.
+  fallback_blur: true
+  fallback_blur_kernel_min: 51
+  fallback_blur_kernel_frac: 0.20
+  fallback_blur_dilate_min: 5
+  fallback_blur_dilate_frac: 0.025
+  fallback_blur_feather_min: 5
+  fallback_blur_feather_frac: 0.020
+
+  # ----- Per-frame dispatch gates -----
+  # Per-frame mask-quality gate. A low-score / under-segmented mask carries
+  # over the last good silhouette under the motion guard; if motion exceeds
+  # the eps, the bad frame falls through to fallback_blur for that gid.
+  mask_floor_ratio: 0.2
+  mask_score_floor: 0.5
+  mask_score_pass_override: 0.85
+  # Bbox-centre delta as a fraction of the last-good bbox diagonal. Below this,
+  # carry the last good mask onto bad/missing frames; above, drop them so the
+  # cached silhouette gets blurred instead.
+  motion_guard_eps: 0.15
+
+  # Gid-level confidence gate: a gid is VACE-rendered only when at least one
+  # of its cached AssignmentInfo entries clears these thresholds. Otherwise
+  # the gid's silhouettes inherit fallback_blur on every frame. Mirrors the
+  # top-level resolver thresholds so a retune is one decision, not two.
+  confidence_face_threshold: 0.45
+  confidence_osnet_abs_threshold: 0.50
+  confidence_osnet_margin_threshold: 0.05
+# === end Wan-VACE backend =======================================================

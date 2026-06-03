@@ -1,3 +1,6 @@
+# torch/torchvision +cu126 wheels live on the PyTorch index, not PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu126
+
 # Core ML / inference
 torch==2.10.0+cu126
 torchvision==0.25.0+cu126
@@ -7,9 +10,12 @@ opencv-python-headless==4.13.0.92
 pillow==12.1.1
 scipy==1.17.1
 
-# ONNX (used by FaceID + ViTPose ONNX runtimes)
+# ONNX (FaceID + ViTPose ONNX runtimes)
 onnx==1.21.0
 onnxruntime-gpu==1.25.0
+protobuf==7.34.1
+ml_dtypes==0.5.4
+flatbuffers==25.12.19
 
 # CUDA wheels (pulled in by torch, pinned for reproducibility — CUDA 12.6)
 nvidia-cublas-cu12==12.6.4.1
@@ -51,18 +57,30 @@ hydra-core==1.3.2
 omegaconf==2.3.0
 PyYAML==6.0.3
 
-# Detection / COCO utils
+# Process management (ComfyUI server discovery + low-RAM restart guard)
+psutil==7.2.2
+
+# Mask RLE utils (track cache)
 pycocotools==2.0.11
-faster-coco-eval==1.7.2
 
 # Re-ID (OSNet via torchreid)
 torchreid==0.2.5
 gdown==5.2.0
 
-# Face identification (KPL face embeddings — buffalo_l weights cached at ~/.insightface/models/)
+# Face identification (KPL face embeddings — buffalo_l weights cached at ~/.insightface/models/).
+# matplotlib is a hard insightface dependency.
 insightface==0.7.3
+matplotlib==3.10.9
 
-# Misc
+# RTMW/DWPose renderer (optional; only loaded when diffusion.yaml pose_renderer: dwpose).
+# rtmlib auto-fetches weights from the MMPose CDN on first use into ~/.cache/rtmlib.
+rtmlib==0.0.15
+
+# Op-edit web UI
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+
+# Misc (torch / omegaconf transitive, pinned for reproducibility)
 filelock==3.25.2
 fsspec==2026.2.0
 Jinja2==3.1.6
@@ -72,26 +90,5 @@ networkx==3.6.1
 packaging==26.2
 sympy==1.14.0
 typing_extensions==4.15.0
-
-# Logging / monitoring
-tensorboard==2.20.0
-tensorboard-data-server==0.7.2
-absl-py==2.4.0
-grpcio==1.80.0
-Markdown==3.10.2
-Werkzeug==3.1.8
-protobuf==7.34.1
-ml_dtypes==0.5.4
-flatbuffers==25.12.19
-
-# antlr4 (OmegaConf dependency)
 antlr4-python3-runtime==4.9.3
-
-# Tests
-pytest==9.0.3
-
 setuptools==70.2.0
-
-# Op-edit web UI
-fastapi==0.136.1
-uvicorn[standard]==0.47.0

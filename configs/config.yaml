@@ -1,6 +1,6 @@
 defaults:
-  - pose: vitpose
-  - anonymization: diffusion
+  - pose: dwpose
+  - anonymization: vace
   - sam3: default
   - temporal: default
   - paths: default

@@ -4,7 +4,7 @@
 
 [[Video Examples]](https://www.youtube.com/playlist?list=PLOGoHFfQuUFbPs4Kd-pnbJl9JEeaJRdlb)
 
-![Side-by-side: source video on the left, anonymized output on the right](data/examples/middle_slice_castle_vs_anon.gif)
+![Side-by-side: source video on the left, anonymized output on the right](data/examples/middle_slice_castle_vs_anon_14b_10sec.gif)
 
 </div>
 
@@ -15,6 +15,7 @@ Offline pipeline that anonymizes video by **replacing** every person — not blu
 ## How it works
 
 ```
+  Pass 1 — track
   video ──► SAM 3 chunked segmentation (60-frame sessions)
               │
               ▼
@@ -24,31 +25,36 @@ Offline pipeline that anonymizes video by **replacing** every person — not blu
               │            Hungarian assigner over KPL identities
               │                  │
               ▼                  ▼
-        AnonymizationStage  ◄── confirmed global_id
-              │
-              ├── diffusion path: ComfyUI inpaint
-              │     • body pass — ControlNet OpenPose + IP-Adapter (low face strength)
-              │     • face polish pass (optional) — IP-Adapter at high face strength on
-              │       a tight head-keypoint mask
+        per-frame track cache ◄── confirmed global_id
+
+  Pass 2 — anonymize (per confirmed gid)
+        plan windows ──► Wan-VACE render ──► stitch into frame
+              │            (grey-control silhouette, reference-anchored)
               │
               └── fallback path: Gaussian-blur-over-mask (closed-world violations,
-                    pre-confirmation frames, mask-quality failures)
+                    unconfirmed gids, mask-quality failures, unpainted silhouettes)
 ```
 
-Closed-world by design: every Identity is seeded from KPL at startup with a frozen face centroid, OSNet appearance centroid, captioned Persona prompt, and a synthetic **Reference Crop**. The Reference Crop — generated once by img2img with an anti-leak gate against the original photos — is the only thing fed to IP-Adapter at runtime, so the real KPL pixels never reach the diffusion stage.
+Closed-world by design: every Identity is seeded from KPL at startup with a frozen face centroid, OSNet appearance centroid, captioned Persona prompt, and a synthetic **Reference Crop**. The Reference Crop is a pre-generated synthetic image loaded from disk; VACE anchors each window's appearance to it, so the real KPL pixels never reach the generation stage.
 
 ## Setup
 
+Requires Python ≥ 3.12, an NVIDIA GPU, and CUDA 12.6.
+
 ```bash
-# 1. Submodules (ComfyUI, SAM 3, ViTPose, OSNet)
+# 1. Runtime directory tree (input/output/cache/model dirs)
+python setup.py
+
+# 2. Vendored deps — clones SAM 3 + ComfyUI into external/
 bash scripts/setup_submodules.sh
 
-# 2. Weights
-bash scripts/download_weights.sh
-python scripts/download_osnet_weights.py
-
-# 3. Python deps (CUDA 12.6 wheels)
+# 3. Python deps (CUDA 12.6 wheels; installs -e external/sam3)
 pip install -r requirements.txt
+
+# 4. Weights — OSNet ReID + SAM 3 + InsightFace buffalo_l
+python scripts/download_weights.py
+# VACE backend weights (Wan2.1-VACE UNet/CLIP/VAE) install into the portable
+# VACE ComfyUI under external/comfyui-vace — run scripts/setup_comfyui_vace.sh.
 ```
 
 ## Usage
@@ -59,4 +65,12 @@ pip install -r requirements.txt
 python scripts/run_pipeline.py --input data/input_videos/example.mp4
 ```
 
-The pipeline scans `data/known_persons/` at startup, seeds one Identity per sub-folder (sorted, 1-indexed `global_id`), runs **First Generation** for any Identity without a cached Reference Crop, then processes the video chunk-by-chunk.
+The pipeline scans `data/known_persons/` at startup, seeds one Identity per sub-folder (sorted, 1-indexed `global_id`), loads each Identity's pre-generated Reference Crop from `data/gallery/reference_crops/`, then tracks the clip (Pass 1) and renders each confirmed gid with VACE (Pass 2).
+
+### Using your own people
+
+The repo ships a ready-to-run example KPL with pre-generated Reference Crops. The pipeline **consumes** Reference Crops as fixed synthetic images — it does not generate them. To anonymize your own footage, add one folder of face photos per person under `data/known_persons/<name>/`, and supply a matching synthetic `data/gallery/reference_crops/<global_id>.png` produced by any image generator (an optional `<global_id>.prompt.txt` overrides the VACE prompt for that Identity).
+
+## License
+
+Released under the [MIT License](LICENSE). The vendored dependencies (SAM 3, ComfyUI, Wan-VACE weights) are fetched at setup time under their own licenses and are not redistributed here.

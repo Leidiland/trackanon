@@ -63,6 +63,17 @@ class WarmIdentityGallery:
             return None
         return max(float(np.dot(query_emb, e.emb)) for e in pool)
 
+    def top_similarities(
+        self, gid: int, kind: str, query_emb: np.ndarray, k: int = 2,
+    ) -> list[float]:
+        """The k highest pool cosines, descending. Surfaces whether one view
+        carries a max-pooled match (top1 >> top2)."""
+        pool = self._pools.get((gid, kind))
+        if not pool:
+            return []
+        sims = sorted((float(np.dot(query_emb, e.emb)) for e in pool), reverse=True)
+        return sims[:k]
+
     def stats(self) -> dict[int, dict]:
         out: dict[int, dict] = {}
         gids = {gid for (gid, _kind) in self._pools.keys()}

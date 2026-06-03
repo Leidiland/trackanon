@@ -11,23 +11,13 @@ prompt: person
 # bigger GPUs. The per-iteration activation peak is governed by
 # num_maskmem × num_objects, not chunk_size, so this knob only addresses
 # the offloadable-state half of SAM 3's VRAM footprint.
-chunk_size: 15
+chunk_size: 25
 
 # Frames of overlap between successive chunks. IdentityResolver re-binds
 # sam3_obj_ids across the chunk boundary using these overlap frames as
 # carryover evidence. L=4 default; ~6.7 % SAM 3 compute overhead at
 # chunk_size=60 (each boundary frame is processed twice).
 overlap_L: 4
-
-# Output mask resolution (input pre-load + output mask are downscaled to this).
-# IMPORTANT: SAM 3's internal compute is fixed at image_size=1008
-# (model_builder.py:763), so this knob only affects the pre-load tensor +
-# output mask resolution — it does NOT reduce compute time. VRAM scales
-# with this knob though: propagate_in_video keeps every chunk frame's mask
-# tensor resident, so 1080 over a 30-frame chunk with 6+ identities can
-# tip the 16 GB budget over the edge into allocator thrash. 720 is the
-# safe default; override to 1080 when running scenes with ≤3 identities.
-output_mask_resolution: 720
 
 # Zero-detection mid-chunk recovery. SAM 3 propagation can emit an empty
 # out_obj_ids list for a single frame even on visually stable footage
@@ -40,29 +30,39 @@ output_mask_resolution: 720
 zero_frame_max_carry: 3
 zero_frame_ghost_score_factor: 0.9
 
+# VRAM profiling: when true, SAM3ChunkedStage.process_chunk resets and reads
+# torch.cuda.max_memory_allocated/reserved per chunk and accumulates a log on
+# `stage.vram_log`. Zero overhead when false. Used by dev/measure_sam3_vram.py.
+profile_vram: false
+
 # HF model id for build_sam3_video_predictor; weights auto-download on first
 # call into ~/.cache/huggingface. Pinned here for reproducibility.
 model_id: facebook/sam3
 
-# IdentityResolver knobs (migrated from configs/tracking/bytetrack.yaml in
-# Phase F). Identification is closed-world over the KPL gallery; FaceID is
-# the primary signal, OSNet is the fallback. See ADR-0005/0006/0007.
+# IdentityResolver knobs. Identification is closed-world over the KPL gallery;
+# FaceID is the primary signal, OSNet is the fallback.
 resolver:
   # KPL (Known Persons Library): one sub-folder per Identity, each containing
   # at least one face-detectable image. Pipeline aborts at startup when this
-  # folder is missing or empty (ADR-0006).
+  # folder is missing or empty.
   kpl_root: data/known_persons
 
-  # Reference Crops: one PNG per Identity (filename = global_id.png).
-  # Loaded at startup, saved after each successful First Generation (ADR-0008).
+  # Reference Crops: one pre-generated PNG per Identity (filename =
+  # global_id.png). Loaded at startup (read-only).
   reference_crop_dir: data/gallery/reference_crops
+
+  # KPL centroid cache: one .npz per sub-folder, keyed by a hash of the
+  # folder's (filename, mtime, size). Hit → skip SAM3 + InsightFace + OSNet
+  # re-extraction at startup. Miss → recompute and overwrite. Operators
+  # invalidate the cache by editing photos; no manual clear is needed.
+  kpl_centroid_cache_dir: data/gallery/kpl_centroids
 
   # FaceIDWrapper: minimum face width below which a face embedding is not
   # trusted; the detection then falls back to OSNet+spatial cost.
   min_face_width_px: 40
 
   # Per-frame face contribution is weighted by det_score * sqrt(face_area /
-  # body_area) (ADR-0005 addendum (b)). det_score below this threshold causes
+  # body_area). det_score below this threshold causes
   # the face to be treated as missing for this frame (no contribution to the
   # running mean). Aligned with `face_quality_floor` so the same face-quality
   # cutoff governs FaceIDWrapper admission, warm-gallery writes, and the
@@ -73,10 +73,13 @@ resolver:
   # emb_weight: weight on OSNet cosine in the no-face-mode pair cost.
   #   pair_cost = emb_weight * (1 - osnet_cosine)
   #             + (1 - emb_weight) * (1 - max(0, 1 - dist/spatial_scale))
+  # NOTE: measured inert on kitchen/meeting clips — this no-face spatial-blend
+  # branch decides ~2% of bindings, and sweeping emb_weight changed 0 gids.
+  # Tuning it is almost certainly wasted effort; the body stream is a scene mush.
   emb_weight: 0.8
   spatial_scale: 300.0
 
-  # Face-quality cost gating (ADR-0018). When a detection's InsightFace
+  # Face-quality cost gating. When a detection's InsightFace
   # det_score is below this floor, the face term is dropped from that row's
   # cost — the row decides on OSNet + spatial only. Defends profile views,
   # motion-blurred faces, and distant detections proactively, before the
@@ -107,7 +110,7 @@ resolver:
   # Path to a torchreid OSNet ReID checkpoint (.pt). The wrapper builds
   # osnet_x1_0 with imagenet weights by default, which produces weak
   # person-discrimination embeddings; loading proper ReID weights restores
-  # inter-person margins. Run scripts/download_osnet_weights.py to fetch.
+  # inter-person margins. Run scripts/download_weights.py to fetch.
   osnet_reid_weights: models/osnet/osnet_x1_0_msmt17.pt
 
   # Number of consecutive face-bearing frames where the matched cosine stays
@@ -116,9 +119,12 @@ resolver:
   low_confidence_streak_max: 5
 
   # IdentityResolver face-sampling cadence. Face embedding is extracted every
-  # Nth frame per track (K=5 → once per 200 ms at 25 fps). SAM 3 mask
-  # continuity makes per-frame face extraction unnecessary.
-  face_sampling_K: 5
+  # Nth frame per track. With chunk_size=15 and face_confirm_M=3, K=2 lets a
+  # binding hit the M threshold by mid-chunk (frame ~6) — at K=5 confirmation
+  # almost always crossed a chunk boundary, leaving the partial_carry IoU
+  # match as the only path forward. K=2 still keeps the FaceID call cost
+  # bounded (InsightFace is cheap relative to SAM 3 propagation).
+  face_sampling_K: 2
 
   # Number of face observations required before a track's running embedding
   # is considered confirmable via Hungarian. One high-quality face also
@@ -138,8 +144,9 @@ resolver:
   # Cross-chunk binding carry: IoU floor for matching an end-of-chunk
   # snapshot to the next chunk's first-frame track. Mirror-image of the
   # intra-chunk revival floor; sized to leave margin for jitter without
-  # admitting unrelated tracks.
-  partial_carry_iou_floor: 0.5
+  # admitting unrelated tracks. 0.45 catches cluster re-decomposition
+  # near-misses (a confirmed person's box shrinks across the boundary).
+  partial_carry_iou_floor: 0.45
 
   # OSNet column-loss demotion margin. Per frame, if the challenger track's
   # OSNet cosine to my gid's centroid exceeds my own by more than this,
@@ -147,6 +154,19 @@ resolver:
   # `osnet_column_loss_streak_max`. 0.05 matches the typical inter-person
   # OSNet margin band — tighter values demote more aggressively.
   osnet_column_loss_margin: 0.05
+
+  # Consecutive frames of column loss before demotion fires.
+  osnet_column_loss_streak_max: 5
+
+  # Locality gate (_locality_ok). A gid seen <= locality_max_stale_frames ago
+  # cannot (re)bind to a box more than locality_max_jump_px from where it was
+  # last seen — physically impossible motion in a few frames. Past the stale
+  # window a re-entry is allowed, EXCEPT a body-only (OSNet) rebind whose
+  # implied speed (jump / gap) exceeds locality_max_speed_px px/frame — the
+  # seat->across-room teleport that steals a gid onto a same-build body.
+  locality_max_jump_px: 300.0
+  locality_max_stale_frames: 5
+  locality_max_speed_px: 100.0
 
   # Warm Identity Gallery: per-gid runtime buffer of face/OSNet embeddings,
   # additive to (never replacing) the frozen KPL centroids. Targets the
@@ -162,8 +182,17 @@ resolver:
     osnet_trust_window_frames: 30
     dedup_cosine: 0.95
     warm_match_floor: 0.5
+    # Body re-id off the warm pool only: ignore the KPL-seed appearance
+    # centroid (reference-photo clothing) for no-face confirmation, scoring
+    # against face-vouched in-video views instead. Feasible only once the pool
+    # holds >= osnet_confirm_min_warm views, which makes the first bind of any
+    # gid face-only. Drops the demonstrably-wrong reference-photo body signal;
+    # paired with the raised confidence_osnet_margin_threshold so the ambiguous
+    # same-build matches it exposes abstain rather than re-bind to a neighbour.
+    osnet_confirm_warm_only: true
+    osnet_confirm_min_warm: 3
     # Mask-sanity gates for op_edit'd writes — defend against SAM3 mask
     # drift during occlusion polluting the operator-assigned gid's pool.
-    # 0.0 disables; defaults below match the issue PRD calibration starting points.
+    # 0.0 disables; defaults below are calibration starting points.
     mask_sanity_iou_floor: 0.2
     mask_sanity_jump_px_frac: 0.15

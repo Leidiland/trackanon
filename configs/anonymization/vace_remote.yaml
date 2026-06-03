@@ -1,0 +1,131 @@
+name: vace_remote
+
+# Same resolver thresholds as the local profile; the identity model doesn't
+# care which ComfyUI host the renders go to.
+confidence_face_threshold: 0.45
+confidence_osnet_abs_threshold: 0.50
+confidence_osnet_margin_threshold: 0.05
+
+generator: vace
+
+# === Wan-VACE backend, remote 14B + multi-worker ===============================
+# Provision a rented GPU box (RTX 6000 Ada / similar 96GB-class) running N
+# ComfyUI processes on ports base_port..base_port+N-1. Tunnel them with
+#   ssh -L 8190:localhost:8190 -L 8191:localhost:8191 ... user@remote
+# Locally these all look like 127.0.0.1 — no other pipeline change.
+#
+# Pipeline shape is identical to the local vace profile (Pass 1 SAM3 +
+# IdentityResolver -> track_cache; Pass 2 plan windows + render + stitch +
+# fallback blur). The only difference is the model size (14B GGUF Q8) and
+# the multi-worker dispatch on the gid loop.
+vace:
+  comfyui_host: "127.0.0.1"
+  comfyui_port: 8190                     # pool.base_port inherits this if unset
+  comfyui_input_dir: "vace_remote/ComfyUI/input"
+  comfyui_output_dir: "vace_remote/ComfyUI/output"
+
+  # 14B GGUF Q8 (default for the rental box) — the quality tier. Fits a single
+  # 32GB card (5090) at 1 worker (~24GB peak). gguf set => UnetLoaderGGUF, and
+  # `unet` is ignored. 1.3B (unet, gguf:null) is the lighter local fallback.
+  unet: "wan2.1_vace_1.3B_fp16.safetensors"
+  gguf: "Wan2.1_14B_VACE-Q8_0.gguf"
+  clip: "umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  vae: "wan_2.1_vae.safetensors"
+  # LightX2V 14B cfg-step-distill LoRA → ~4-6 steps at cfg=1 match many-step
+  # quality at ~10x less GPU (no 1.3B LightX2V exists upstream). With
+  # control_mode=grey the silhouette mask is a HARD constraint the distill LoRA
+  # can't wash out, so strength 1.0 is safe (pose_gen's soft skeleton control
+  # WOULD be drowned at 1.0 — another reason grey wins). deploy.sh (MODEL=14B)
+  # fetches this. 1.3B local uses the CausVid rank32 1.3B LoRA @0.8.
+  lora: "Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors"
+  lora_strength: 1.0
+  # UNET load precision (helps BOTH this distill profile and a native run).
+  # "fp8_e4m3fn" ≈ 1.4-1.7x on fp8 tensor cores (Ada/Hopper/Blackwell), small
+  # quality cost — A/B before defaulting on. default | fp8_e4m3fn | fp8_e5m2 | fp8_e4m3fn_fast.
+  weight_dtype: "default"
+
+  # ----- Multi-worker pool -----
+  # 1.3B peak ≈ ~11–14GB per active job in no-offload mode; 96GB Ada/Blackwell
+  # comfortably fits 6 (~84GB combined, ~12GB headroom for spikes). Drop to 4
+  # on 80GB cards, 2 for 14B Q8, 1 for 14B fp16. deploy.sh's WORKERS arg must
+  # match this number (otherwise the pipeline either wastes servers or tries
+  # ports that don't exist).
+  pool:
+    workers: 1                           # workers on ONE GPU share its compute (no speedup) + each loads a full model copy (won't fit 2 on 24GB); >1 only pays off with multi-GPU + per-GPU pinning. Also caps local stitch RAM (workers×window_len 4K frames).
+    # base_port: 8190                    # inherits comfyui_port
+
+  # Concurrent gid render threads. Default (0/unset) = pool.workers. Oversubscribe
+  # past the worker count ONLY on a big-RAM host: extra threads keep the GPU pool
+  # fed while others are in their CPU-bound stitch, but cost O(concurrency ×
+  # window 4K frames) RAM. On the local 24GB box leave this unset.
+  render_concurrency: 0
+
+  target_gids: []
+  # 4n+1. 49 fits 14B Q8 on a single 32GB card (5090); an 81-frame window's
+  # latents ~5x the VRAM and OOM there. preserve_overlap + color_anchor carry
+  # identity across boundaries, so 49 costs no real coherence. Raise to 81 only
+  # on >=48GB hosts; don't exceed 81 (compute grows ~linearly with length).
+  window_len: 49
+  overlap: 13
+  max_bridge: 2
+  crop_pad: 0.10
+  crop_height: 832
+  grey_control: true
+  # "grey" (default), "pose" (skeleton-in-the-hole — bakes lines, not recommended),
+  # or "pose_gen" (full-canvas pose + white mask → clean posed persona on a
+  # hallucinated bg; the stitch mattes the persona and composites it into the
+  # original SAM3 silhouette, residual → fallback blur).
+  control_mode: "grey"
+  pose_mask_dilate_px: 0
+  # pose_gen only: the persona is matted from the hallucinated bg and its
+  # own pixels are extended to fill the whole silhouette, so the full-silhouette
+  # paste is all persona — no generated bg, no blurred residual. feather 0 =
+  # crisp edge. Dilate lets the persona extend a few px past a tight SAM3 mask
+  # (also covers SAM3 under-segmentation); 0 = exact mask.
+  posegen_silhouette_dilate_px: 0
+  posegen_feather_px: 0
+  reference_dir: "data/gallery/reference_crops"
+
+  # 14B can afford more steps + a small cfg bump vs 1.3B (the cost scales with
+  # the GPU you're paying for, not your local 16GB).
+  prompt: "a person sitting in a living room, photorealistic, natural indoor light, sharp detail"
+  negative: "blurry, low quality, distorted, deformed, extra limbs, extra people, mutated, watermark, text, cartoon, oversaturated"
+  seed: 42
+  steps: 4                               # LightX2V cfg-step-distill: ~4 steps suffices (was 30)
+  cfg: 1.0                               # distill runs guidance-free (was 7.0) → no negative pass, ~2x faster/step
+  shift: 8.0
+  sampler: "uni_pc"
+  scheduler: "simple"
+  strength: 1.0
+  fps: 25
+  timeout: 2700.0
+  poll_interval: 4.0
+
+  # Cross-window preserve carries from the prior window's stitch — model-
+  # agnostic, 14B benefits the same way as 1.3B.
+  preserve_overlap: true
+
+  feather_px: 6
+  color_anchor: true
+  # "window0" = full-L*a*b drift correction to W0. "reference" (default) =
+  # chroma-only pull toward the persona crop (L untouched, chroma can only drop),
+  # desaturating the W2+ magenta without the glow. See vace.yaml.
+  color_anchor_seed: reference
+  color_anchor_chroma_guard: 4.0
+  fallback_blur: true
+  fallback_blur_kernel_min: 51
+  fallback_blur_kernel_frac: 0.20
+  fallback_blur_dilate_min: 5
+  fallback_blur_dilate_frac: 0.025
+  fallback_blur_feather_min: 5
+  fallback_blur_feather_frac: 0.020
+
+  mask_floor_ratio: 0.2
+  mask_score_floor: 0.5
+  mask_score_pass_override: 0.85
+  motion_guard_eps: 0.15
+
+  confidence_face_threshold: 0.45
+  confidence_osnet_abs_threshold: 0.50
+  confidence_osnet_margin_threshold: 0.05
+# === end Wan-VACE backend, remote ==============================================

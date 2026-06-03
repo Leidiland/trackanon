@@ -1,0 +1,32 @@
+# DWpose via rtmlib (RTMW-DW-x-l whole-body keypoints, ONNX Runtime).
+#
+# Weights are auto-fetched by rtmlib into ~/.cache/rtmlib on first use
+# (YOLOX-m HumanArt detector + RTMW-DW-x-l pose model). No manual download.
+kind: dwpose
+name: RTMW-DW-x-l
+
+# rtmlib mode preset: "lightweight" | "balanced" | "performance".
+# Balanced runs RTMW-DW-x-l at 192x256 and produces full COCO-Wholebody
+# keypoints (face-68 + hand-21x2 in addition to body COCO-17).
+mode: balanced
+
+# Keypoints below this confidence are treated as absent. Calibrated on
+# 5_sec_test_1080p25 (104 detections): the joints the diffusion gates read
+# (nose/eyes/shoulders/hips) score 0.65-0.89 — well clear of 0.3, with the
+# >=3-valid / nose / both-eyes gates at ~100%. Only occluded ankles/wrists
+# sit near the floor and aren't consumed. 0.3 confirmed.
+conf_threshold: 0.3
+
+# Per-track One Euro temporal smoothing of run() keypoints, in full-frame
+# pixel coords (the crop frame jitters, so smoothing must be frame-global).
+# Feeds the TPS warp / pose gate / visualization; the ControlNet conditioning
+# skeleton (render() re-detect on the crop) is untouched. Cutoffs are in
+# cycles-per-frame (time = frame index, sub-Nyquist < 0.5). On by default.
+smoothing:
+  enabled: true
+  filter: one_euro
+  min_cutoff: 0.1     # lower = more smoothing at rest
+  beta: 0.02          # higher = less lag in motion
+  d_cutoff: 1.0
+  conf_floor: 0.3     # below this a joint is held, not updated
+  reset_after_missing_frames: 5
